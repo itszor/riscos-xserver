@@ -24,9 +24,13 @@ is broken against Internet 5.02 (UnixLib bug). See `PORTING-NOTES.md`.
 - Source changes to xorg-server: two small `#ifdef __riscos__` patches
   (precompiled XKB keymaps; no lock file). See `patches/`.
 
-**Blocking issue found, in the emulator, not the server:** large transfers
-through rpcemu-extended's NAT port-forward wedge it. Details in
-`PORTING-NOTES.md`.
+**Network wedge in the emulator: fixed.** Large transfers used to stop the
+guest's networking (a lost receive interrupt in rpcemu-extended). Fixed there
+in commit 800f1e4; details in `PORTING-NOTES.md`.
+
+**Phase 2, step 1 (the server as a Wimp task): works.** The server sleeps in
+`Wimp_Poll` between requests and keeps the desktop responsive under load.
+See `evloop/README.md`.
 
 ## Layout
 
@@ -42,7 +46,7 @@ through rpcemu-extended's NAT port-forward wedge it. Details in
 | `libsha1/` | Minimal SHA-1 with the libsha1 API (tested against FIPS vectors) |
 | `xkb/make-xkm.sh` | Precompiles us/gb keymaps (evdev keycodes) on the build host |
 | `patches/` | Our changes to xorg-server 1.19.7, as a diff |
-| `tools/` | `start-xvfb.sh`, `xping` (in-guest X handshake/GetImage test), VNC screenshot/click/key, CPU sampler |
+| `tools/` | `start-xvfb.sh`, `xping` (in-guest X handshake/GetImage test), `swicount.sh` (SWIs called from application space: shows busy-waiting), `waitdesk.sh`, VNC screenshot/click/key, CPU sampler |
 | `evloop/` | The Wimp_Poll event loop (`rwl`), its test task and results (Phase 2, step 1) |
 | `guest/` | RISC OS-side files for the machine's HostFS `XDev` folder: the Xvfb launcher and small BASIC helpers |
 | `phase0/` | Toolchain smoke test |

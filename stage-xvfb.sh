@@ -10,3 +10,5 @@ docker run --rm -u "$(id -u):$(id -g)" -v "$X:/xdev" xdev-gccsdk:1 bash -c '
   elf2aif /xdev/logs/Xvfb.stripped /xdev/logs/Xvfb,ff8 >/dev/null'
 cp "$X/logs/Xvfb,ff8" "$H/"
 ls -l "$H/Xvfb,ff8"
+# The RISC OS-side helpers (launcher, BASIC tools).
+cp "$X"/guest/* "$H/"

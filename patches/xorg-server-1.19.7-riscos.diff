@@ -96,3 +96,143 @@
  
  /*
   * LockServer --
+--- a/os/ospoll.c	2019-02-02 09:35:15.000000000 +0000
++++ b/os/ospoll.c	2026-11-06 13:57:57.969183290 +0000
+@@ -32,6 +32,17 @@
+ #include "ospoll.h"
+ #include "list.h"
+ 
++#ifdef __riscos__
++/*
++ * RISC OS: the server is a co-operative Wimp task, so it must not block in
++ * poll(). It sleeps in Wimp_Poll instead (rwl, from the port's evloop/),
++ * woken by the Internet event that async sockets raise. See riscos_wait().
++ */
++#include <signal.h>
++#include <rwl.h>
++#include "os.h"                 /* LogMessage, GiveUp */
++#endif
++
+ #if !HAVE_OSPOLL && HAVE_EPOLL_CREATE1
+ #include <sys/epoll.h>
+ #define EPOLL           1
+@@ -286,6 +297,11 @@
+         ospoll->fds[pos].events = 0;
+         ospoll->fds[pos].revents = 0;
+         ospoll->osfds[pos].revents = 0;
++#ifdef __riscos__
++        /* Async, so the Internet module raises its event for this socket
++           and wakes riscos_wait(). Harmless on anything that isn't one. */
++        (void) rwl_watch_socket(fd);
++#endif
+     }
+     ospoll->osfds[pos].trigger = trigger;
+     ospoll->osfds[pos].callback = callback;
+@@ -385,6 +401,78 @@
+ }
+ 
+ 
++#if defined(__riscos__) && POLL
++/* Longest the server may go without giving the Wimp a turn while it is busy,
++ * and the longest it sleeps while a client's output is blocked: the Internet
++ * event reports data and connections arriving, not room to write. */
++#define RISCOS_YIELD_MS         20
++#define RISCOS_WRITE_WAIT_MS    10
++
++/*
++ * poll() for the RISC OS desktop. Checks the sockets without blocking first;
++ * if nothing is ready and the caller is prepared to wait, sleeps in Wimp_Poll
++ * (rwl_wait) until a socket event, the timeout, or a quit request, then checks
++ * again. Data that arrived before a socket was made async, or between checks,
++ * is found by the first check rather than waited for.
++ *
++ * Outside the desktop rwl_init() fails, and this is plain poll().
++ */
++static int
++riscos_wait(struct pollfd *fds, int num, int timeout)
++{
++    static enum { RISCOS_UNSET, RISCOS_WIMP, RISCOS_PLAIN } mode;
++    static long last_yield;
++    int nready, i;
++
++    if (mode == RISCOS_UNSET) {
++        const char *why = "";
++
++        if (rwl_init("X server", &why) == 0) {
++            mode = RISCOS_WIMP;
++            for (i = 0; i < num; i++)
++                (void) rwl_watch_socket(fds[i].fd);
++            LogMessage(X_INFO, "RISC OS: running as a Wimp task\n");
++        } else {
++            mode = RISCOS_PLAIN;
++            LogMessage(X_WARNING, "RISC OS: not a Wimp task (%s); "
++                       "using plain poll()\n", why);
++        }
++        last_yield = rwl_now_ms();
++    }
++    if (mode == RISCOS_PLAIN)
++        return xserver_poll(fds, num, timeout);
++
++    nready = xserver_poll(fds, num, 0);
++    if (nready != 0 || timeout == 0) {
++        /* Busy: still let the rest of the desktop run now and then. */
++        if (rwl_now_ms() - last_yield >= RISCOS_YIELD_MS) {
++            if (rwl_wait(0) == RWL_QUIT)
++                goto quit;
++            last_yield = rwl_now_ms();
++        }
++        return nready;
++    }
++
++    for (i = 0; i < num; i++)
++        if (fds[i].events & POLLOUT) {
++            if (timeout < 0 || timeout > RISCOS_WRITE_WAIT_MS)
++                timeout = RISCOS_WRITE_WAIT_MS;
++            break;
++        }
++
++    if (rwl_wait(timeout) == RWL_QUIT)
++        goto quit;
++    last_yield = rwl_now_ms();
++    return xserver_poll(fds, num, 0);
++
++quit:
++    /* As for SIGTERM: close the clients down and exit. */
++    LogMessage(X_INFO, "RISC OS: asked to quit by the desktop\n");
++    GiveUp(SIGTERM);
++    return 0;
++}
++#endif
++
+ int
+ ospoll_wait(struct ospoll *ospoll, int timeout)
+ {
+@@ -414,7 +502,11 @@
+     ospoll_clean_deleted(ospoll);
+ #endif
+ #if POLL
++#ifdef __riscos__
++    nready = riscos_wait(ospoll->fds, ospoll->num, timeout);
++#else
+     nready = xserver_poll(ospoll->fds, ospoll->num, timeout);
++#endif
+     ospoll->changed = FALSE;
+     if (nready > 0) {
+         int f;
+--- a/dix/dispatch.c	2019-02-02 09:35:14.000000000 +0000
++++ b/dix/dispatch.c	2026-11-06 13:57:57.765525773 +0000
+@@ -222,7 +222,14 @@
+ #define SMART_SCHEDULE_MAX_SLICE	15
+ 
+ #ifdef HAVE_SETITIMER
++#ifdef __riscos__
++/* UnixLib refuses setitimer in a Wimp task, so the scheduler keeps time from
++   the clock instead, as -dumbSched would make it. (Building without
++   HAVE_SETITIMER instead does not link: os/utils.c still uses this.) */
++#define SMART_SCHEDULE_DEFAULT_SIGNAL_ENABLE FALSE
++#else
+ #define SMART_SCHEDULE_DEFAULT_SIGNAL_ENABLE HAVE_SETITIMER
++#endif
+ Bool SmartScheduleSignalEnable = SMART_SCHEDULE_DEFAULT_SIGNAL_ENABLE;
+ #endif
+ 

@@ -18,6 +18,9 @@ Every workaround or patch needed to build for RISC OS 3.70 with GCCSDK 4.7.4.
 | xorg-server XKB | Runs external `xkbcomp` to compile the keymap | `xkb/ddxLoad.c`: load `<xkbdir>/precompiled/<layout>.xkm` (made on the build host by `xkb/make-xkm.sh`) |
 | UnixLib `poll` | Leaves `revents` stale when `select` times out (`unix/poll.c`) | Harmless for the X server (ospoll only reads revents after a positive return); fix upstream |
 | UnixLib `link` | Not available (the lock file needs it) | See lock file row |
+| Running as a Wimp task | The server must not block in `poll()`; the desktop would stop | `os/ospoll.c`: `riscos_wait()` checks sockets with a zero-timeout poll, then sleeps in `rwl_wait()` (evloop/) until the Internet event, a timer or Message_Quit; yields to the Wimp at least every 20 ms when busy; sleeps at most 10 ms while output is blocked. `ospoll_add` makes each socket async. Falls back to plain `poll()` outside the desktop |
+| Smart scheduler | Uses `setitimer`, which UnixLib refuses in a Wimp task (silently, as the server doesn't check) | `dix/dispatch.c`: signal-driven scheduling off by default on RISC OS (as `-dumbSched`). Configuring without `HAVE_SETITIMER` instead doesn't link: `os/utils.c` still references the flag |
+| Starting the server | `*WimpTask` gives the new task the default "next" slot, too small for the 2.7 MB image ("No writable memory at this address") | `guest/RunXvfb` starts `guest/StartXvfb` as the task, which sets its own `WimpSlot` first, as a `!Run` file does |
 
 ## Not a porting problem: rpcemu-extended network wedge (root cause found)
 

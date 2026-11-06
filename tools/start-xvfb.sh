@@ -13,6 +13,9 @@ for i in $(seq 1 60); do
     timeout 15 "${RUN[@]}" 'Show Inet$Started' 2>/dev/null | grep -q 'Yes' && break
     sleep 2
 done
+# Xvfb is a Wimp task now: starting one before the desktop is up stalls the
+# boot, so wait for the icon bar too.
+"$(dirname "$0")/waitdesk.sh" 240 >/dev/null
 rm -f "$LOG"
 timeout 30 "${RUN[@]}" 'Obey HostFS::HostFS.$.XDev.RunXvfb' >/dev/null
 timeout 15 "${RUN[@]}" 'Dir HostFS::HostFS.$.XDev' >/dev/null

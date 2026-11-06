@@ -48,10 +48,15 @@ python3 hosttest.py            (on the host)
 - Output to a HostFS file may not appear until the file is closed, even after
   `fflush`, so query a running task over its socket (`stats`).
 
-## Next: into the X server
+## In the X server
 
-`os/ospoll.c` / `os/WaitFor.c`: make `ospoll_wait()` call `rwl_wait(timeout)`
-and then the existing `poll()` with a zero timeout; call `rwl_watch_socket()`
-wherever the server adds an fd (the listener in `os/connection.c`, each client
-in `AllocNewConnection`); `rwl_init()` early in `OsInit`. Start the server with
-`-dumbSched`, since `setitimer` is refused in Wimp tasks.
+Done (see `PORTING-NOTES.md`): `os/ospoll.c` calls `rwl` through
+`riscos_wait()`, and `build-xserver.sh` builds `rwl` as `librwl.a` and links
+it. Results with Xvfb as a Wimp task on "My RiscPC", 2026-11-06:
+
+| Check | Result |
+|---|---|
+| Idle | no SWI calls from the server in 5 s (`tools/swicount.sh`): it sleeps in `Wimp_Poll` |
+| Linux clients (`xlogo`, `xeyes`, `xclock -update 1`, `xterm`) | drawn correctly; full-screen `xwd` back to the host in 0.1 s |
+| Desktop under load: back-to-back `xwd` for 15 s (146 transfers, ~6 MB/s) | HostCmd round trips 60-117 ms, against 36-40 ms idle |
+| Message_Quit (`guest/quitx`) | server exits, clients disconnected; it starts again afterwards |
