@@ -1,0 +1,18 @@
+10 ON ERROR PRINT "ERR: ";REPORT$;" at line ";ERL:END
+20 PROCtry("OS_PlatformFeatures",&6D)
+30 PROCtry("OS_SynchroniseCodeAreas",&6E)
+40 PROCtry("OS_CallASWI",&6F)
+50 PROCtry("OS_CallASWIR12",&71)
+60 PROCtry("OS_ReadSysInfo 6",&58)
+70 END
+80 DEF PROCtry(n$,s%)
+90 LOCAL ERROR
+100 ON ERROR LOCAL PRINT n$;": ";REPORT$:ENDPROC
+110 CASE s% OF
+120 WHEN &6D: SYS "OS_PlatformFeatures",0 TO a%:PRINT n$;": ok r0=&";~a%
+130 WHEN &6E: SYS "OS_SynchroniseCodeAreas",0:PRINT n$;": ok"
+140 WHEN &6F: SYS &6F,0,0,0,0,0,0,0,0,0,0,&10 TO a%:PRINT n$;": ok"
+150 WHEN &71: SYS &71:PRINT n$;": ok"
+160 WHEN &58: SYS "OS_ReadSysInfo",6,0,0 TO a%:PRINT n$;": ok r0=&";~a%
+170 ENDCASE
+180 ENDPROC

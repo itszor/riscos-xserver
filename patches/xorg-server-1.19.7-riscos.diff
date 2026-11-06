@@ -1,0 +1,98 @@
+--- a/xkb/ddxLoad.c	2019-02-02 09:35:15.000000000 +0000
++++ b/xkb/ddxLoad.c	2026-11-06 11:50:39.769718254 +0000
+@@ -460,6 +460,68 @@
+     return XkbDDXNamesFromRules(dev, rmlvo->rules, &mlvo, kccgst);
+ }
+ 
++#ifdef __riscos__
++/*
++ * RISC OS: there is no xkbcomp to run (and no cheap fork/exec to run it
++ * with), so keymaps are compiled on the build host and shipped as .xkm
++ * files. Load <XkbBaseDirectory>/precompiled/<layout>.xkm, falling back to
++ * default.xkm. Rules, model, variant and options are ignored; only the
++ * first layout of a comma-separated list is used.
++ */
++static XkbDescPtr
++RiscosLoadPrecompiledKeymap(XkbRMLVOSet * rmlvo, int need)
++{
++    char layout[64] = "";
++    const char *candidates[2];
++    const char *base = XkbBaseDirectory ? XkbBaseDirectory : XKB_BASE_DIRECTORY;
++    int i, n = 0;
++
++    if (rmlvo && rmlvo->layout) {
++        const char *s = rmlvo->layout;
++
++        /* Keep it to a safe file name: [A-Za-z0-9_-], up to the first comma. */
++        while (*s && *s != ',' && n < (int) sizeof(layout) - 1) {
++            if (isalnum((unsigned char) *s) || *s == '_' || *s == '-')
++                layout[n++] = *s;
++            s++;
++        }
++        layout[n] = '\0';
++    }
++    candidates[0] = layout;
++    candidates[1] = "default";
++
++    for (i = 0; i < 2; i++) {
++        char path[PATH_MAX];
++        XkbDescPtr xkb = NULL;
++        unsigned missing, provided;
++        FILE *file;
++
++        if (candidates[i][0] == '\0')
++            continue;
++        if (snprintf(path, sizeof(path), "%s/precompiled/%s.xkm", base,
++                     candidates[i]) >= (int) sizeof(path))
++            continue;
++        file = fopen(path, "rb");
++        if (!file) {
++            LogMessage(X_INFO, "XKB: no precompiled keymap %s\n", path);
++            continue;
++        }
++        missing = XkmReadFile(file, need, XkmAllIndicesMask, &xkb);
++        fclose(file);
++        provided = (need | XkmAllIndicesMask) & ~missing;
++        if (xkb && (need & provided) == need) {
++            LogMessage(X_INFO, "XKB: loaded precompiled keymap %s\n", path);
++            return xkb;
++        }
++        LogMessage(X_ERROR, "XKB: precompiled keymap %s is incomplete "
++                   "(missing 0x%x)\n", path, missing);
++        if (xkb)
++            XkbFreeKeyboard(xkb, 0, TRUE);
++    }
++    return NULL;
++}
++#endif
++
+ /**
+  * Compile the given RMLVO keymap and return it. Returns the XkbDescPtr on
+  * success or NULL on failure. If the components compiled are not a superset
+@@ -473,6 +535,10 @@
+     XkbComponentNamesRec kccgst = { 0 };
+     char name[PATH_MAX];
+ 
++#ifdef __riscos__
++    return RiscosLoadPrecompiledKeymap(rmlvo, need);
++#endif
++
+     if (XkbRMLVOtoKcCGST(dev, rmlvo, &kccgst)) {
+         provided =
+             XkbDDXLoadKeymapByNames(dev, &kccgst, XkmAllIndicesMask, need, &xkb,
+--- a/os/utils.c	2019-02-02 09:35:15.000000000 +0000
++++ b/os/utils.c	2026-11-06 11:53:07.365714535 +0000
+@@ -259,7 +259,13 @@
+ #else /* LOCK_SERVER */
+ static Bool StillLocking = FALSE;
+ static char LockFile[PATH_MAX];
++#ifdef __riscos__
++/* The lock file protocol needs link(), which RISC OS filing systems lack,
++ * and -nolock is root-only. RISC OS is single-user: never lock. */
++static Bool nolock = TRUE;
++#else
+ static Bool nolock = FALSE;
++#endif
+ 
+ /*
+  * LockServer --

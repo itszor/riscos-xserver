@@ -1,0 +1,2 @@
+10 SYS "OS_ReadDynamicArea",6 TO ,size%
+20 PRINT "freepool ";size% DIV 1024;" KB"

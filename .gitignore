@@ -1,0 +1,14 @@
+# Generated: unpacked and patched sources, cross-built libraries, logs, staging
+/build/
+/prefix/
+/logs/
+/stage/
+/sources/*.tar.*
+# Cross-built binaries (ELF and RISC OS AIF/module images)
+*,ff8
+*,ffa
+*.o
+/phase0/smoke
+/evloop/evtest
+/tools/xping/xping
+__pycache__/

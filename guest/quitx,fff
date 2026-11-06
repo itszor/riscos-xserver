@@ -1,0 +1,14 @@
+10 REM Send Message_Quit to the task called "X loop test"
+20 DIM b% 64, m% 256
+30 next%=0: handle%=0
+40 REPEAT
+50   SYS "TaskManager_EnumerateTasks",next%,b%,16 TO next%
+60   IF b%!0<>0 THEN
+70     n$="": p%=b%!4: WHILE ?p%>=32: n$+=CHR$?p%: p%+=1: ENDWHILE
+80     IF n$="X loop test" THEN handle%=b%!0
+90   ENDIF
+100 UNTIL next%<0
+110 IF handle%=0 THEN PRINT "X loop test is not running": END
+120 m%!0=20: m%!12=0: m%!16=0
+130 SYS "Wimp_SendMessage",17,m%,handle%
+140 PRINT "sent Message_Quit to task &";~handle%

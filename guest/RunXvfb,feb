@@ -1,0 +1,4 @@
+| Obey file: start Xvfb in its own TaskWindow, stderr to <Obey$Dir>.xvfblog
+RMEnsure SharedUnixLibrary 1.07 RMLoad <Obey$Dir>.SharedULib
+Dir <Obey$Dir>
+TaskWindow "Xvfb :0 -listen tcp -ac -xkbdir xkb -screen 0 640x480x16 2> xvfblog" -wimpslot 24000K -name Xvfb -quit

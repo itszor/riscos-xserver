@@ -1,0 +1,3 @@
+10 DIM b% 256
+20 SYS &56AC4,3,b%,1
+30 PRINT "network IRQ raised"
