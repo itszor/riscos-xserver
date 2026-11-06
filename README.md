@@ -57,6 +57,13 @@ with `XDev.RunX` (640x480 by default; edit `XDev.StartX` for `-screen WxH` or
   from the RISC OS keyboard setting (`OS_Byte` 71: UK gives `gb`, USA `us`);
   `-xkb-layout` overrides it. Losing the caret releases any keys X thinks are
   held. `-keylog` (or `XDev.RunXtest`) logs each key and its mapping.
+- The X cursor is the RISC OS pointer (`hw/kdrive/riscos/cursor.c`). Each X
+  cursor becomes a 2bpp sprite, and while the pointer is over the window the
+  current one is pointer shape 2 (`OS_SpriteOp` 36, with its palette); leaving
+  the window or quitting puts the Wimp's `ptr_default` back. Core cursors keep
+  their two colours exactly; full-colour (ARGB) ones are reduced to
+  transparent, white, black and grey; anything bigger than 32x32 is clipped
+  around the hot spot. X no longer draws a cursor into the framebuffer.
 - Closing the window, or Message_Quit, shuts the server down.
 - The window and sprite are kept across server resets.
 
@@ -74,12 +81,21 @@ its release. Typed into an `xterm` with the `gb` layout, `|`, `\` and `£`
 come out right. Taking the caret away while Shift is held releases Shift in
 X, and the real release is not delivered twice.
 
+Pointer: over an `xterm` the pointer is X's I-beam, over the root the X
+cursor, and off the window the RISC OS arrow with its own colours, with
+nothing drawn into the window. `xsetroot` with a core red-on-yellow `watch`
+(`XCURSOR_CORE=1`) shows exactly red and yellow; Adwaita's ARGB arrow at 24
+pixels shows black with a white outline, and at 48 pixels is clipped to 32x32
+at the tip. Quitting with the pointer over the window restores the arrow.
+
 Not done yet:
 - Keys for other windows (F12, hot keys) are not passed on while the X window
   has the caret.
 - Only `us` and `gb` keymaps are precompiled; other territories fall back to
   `us`.
-- Two pointers: X draws its own cursor into the sprite under the RISC OS one.
+- Full-colour cursors are reduced to three colours, and cursors over 32x32
+  are clipped.
+- X pointer warps (`XWarpPointer`) do not move the RISC OS pointer.
 - One size: no resizing and no RandR size changes.
 - The window opens over the icon bar on a small desktop.
 - Untested on 256-colour and 32bpp desktops.
