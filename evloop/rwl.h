@@ -49,7 +49,23 @@ int rwl_task_handle(void);
  * makes rwl_wait() return RWL_EVENT.
  */
 typedef int (*rwl_handler)(int reason, int *block, void *data);
+
+/* Not a Wimp reason: key events are waiting (block is NULL). The handler
+   takes them with rwl_key_next(). */
+#define RWL_REASON_KEYS	0x100
 void rwl_set_handler(rwl_handler fn, void *data);
+
+/*
+ * Raw keys, from a KeyV handler in the RMA: every key going down or up, by
+ * RISC OS low-level key number, including modifiers on their own. Queued only
+ * while capture is on, which the caller turns on while it has the input focus
+ * (Gain_Caret) and off when it loses it. Up to 31 events are held; any more
+ * are counted by rwl_key_overflows() and dropped.
+ */
+void rwl_key_capture(int on);
+/* Take the next key event: 1 with *key and *pressed set, or 0 if none. */
+int rwl_key_next(int *key, int *pressed);
+unsigned rwl_key_overflows(void);
 
 /* Ask for a null event at least every ms milliseconds (0: none), for polling
    that has no event of its own, such as tracking the pointer. */

@@ -14,8 +14,17 @@ The X server has to be a co-operative Wimp task, so it can't block in
   or `RWL_QUIT` (Message_Quit). The pollword is cleared before returning, so
   an event that arrives while the caller is working makes the next wait return
   at once.
+- The same RMA block has a `KeyV` handler: while capture is on
+  (`rwl_key_capture`, which Xriscos ties to having the caret) it queues every
+  key going down or up, by low-level key number, in a 32-slot ring, and sets
+  the pollword. `rwl_wait` then calls the event handler with
+  `RWL_REASON_KEYS`, and it takes them with `rwl_key_next()`.
+- Other Wimp events go to the handler set with `rwl_set_handler()`;
+  `rwl_set_null_interval()` asks for null events (pointer tracking), and a
+  handler that has queued work makes `rwl_wait` return `RWL_EVENT`.
 - `rwl_shutdown()` (also run at exit) closes the task, disables the event and
-  releases the vector. The RMA block is freed only after a successful release.
+  releases both vectors. The RMA block is freed only after both releases
+  succeed.
 
 `evtest.c` is a TCP echo server on port 6000 built on it, with a 1-second timer
 standing in for X's timers. `hosttest.py` drives it from the host through the

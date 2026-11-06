@@ -1,0 +1,3 @@
+| Run by RunXtest as a new Wimp task.
+WimpSlot -min 8000K -max 8000K
+Run <Obey$Dir>.Xriscos :0 -listen tcp -ac -xkbdir xkb -screen 640x480 -keylog 2> xlog

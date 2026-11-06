@@ -1,0 +1,3 @@
+10 SYS "OS_Byte",71,255 TO ,kb%
+20 SYS "OS_Byte",71,127 TO ,al%
+30 PRINT "keyboard ";kb%;" alphabet ";al%

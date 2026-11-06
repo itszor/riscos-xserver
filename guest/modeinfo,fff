@@ -1,0 +1,4 @@
+10 SYS "OS_ReadModeVariable",-1,9 TO ,,l%
+20 SYS "OS_ReadModeVariable",-1,4 TO ,,x%
+30 SYS "OS_ReadModeVariable",-1,5 TO ,,y%
+40 PRINT "log2bpp ";l%;" xeig ";x%;" yeig ";y%

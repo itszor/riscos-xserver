@@ -1,0 +1,5 @@
+| Obey file: start Xriscos with -keylog (each RISC OS key event and its
+| mapping, in <Obey$Dir>.xlog), for checking the keyboard.
+RMEnsure SharedUnixLibrary 1.07 RMLoad <Obey$Dir>.SharedULib
+Dir <Obey$Dir>
+WimpTask Obey <Obey$Dir>.StartXtest

@@ -331,7 +331,7 @@
 +	$(AM_V_at)rm -f $(bin_PROGRAMS) && $(MAKE) $(bin_PROGRAMS)
 --- a/hw/kdrive/riscos/riscos.h	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscos.h	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,45 @@
 +/*
 + * Xriscos: the kdrive X server for the RISC OS desktop.
 + *
@@ -368,10 +368,18 @@
 +   Returns non-zero if an event was queued. */
 +int riscosPollPointer(void);
 +
++/* Pass keys queued by rwl's KeyV handler to X (kbd.c); release every key X
++   thinks is held, when the window loses the focus. Both return non-zero if
++   events were queued. */
++int riscosKeyEvents(void);
++/* -keylog: report every RISC OS key event and its mapping on stderr. */
++extern Bool riscosKeyLog;
++int riscosKeysReleaseAll(void);
++
 +#endif
 --- a/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,565 @@
+@@ -0,0 +1,581 @@
 +/*
 + * Xriscos: the kdrive X server for the RISC OS desktop.
 + *
@@ -407,6 +415,8 @@
 +#define Pointer_Entering_Window 5
 +#define Mouse_Click             6
 +#define Key_Pressed             8
++#define Lose_Caret              11
++#define Gain_Caret              12
 +#define User_Message            17
 +#define User_Message_Recorded   18
 +#define Message_ModeChange      0x400c1
@@ -726,9 +736,23 @@
 +        }
 +        return 0;
 +    case Key_Pressed:
-+        /* Keyboard input is not handled yet: pass the key on. */
-+        _swix(Wimp_ProcessKey, _IN(0), block[6]);
++        /* With the focus, keys reach X through KeyV (rwl), as presses and
++           releases of physical keys; the Wimp's translated copy is not
++           wanted. Anything else is passed on. */
++        if (block[0] != rd.window)
++            _swix(Wimp_ProcessKey, _IN(0), block[6]);
 +        return 0;
++    case Gain_Caret:
++        if (block[0] == rd.window)
++            rwl_key_capture(1);
++        return 0;
++    case Lose_Caret:
++        if (block[0] != rd.window)
++            return 0;
++        rwl_key_capture(0);
++        return riscosKeysReleaseAll();
++    case RWL_REASON_KEYS:
++        return riscosKeyEvents();
 +    case User_Message:
 +    case User_Message_Recorded:
 +        if (block[4] == Message_ModeChange) {
@@ -989,18 +1013,93 @@
 +};
 --- a/hw/kdrive/riscos/kbd.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/kbd.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,134 @@
 +/*
-+ * Xriscos keyboard. Not wired up yet: keys typed into the window are passed
-+ * back to the Wimp. Scan codes are evdev's (Linux key code), to match the
-+ * precompiled keymaps, so X keycodes are scan code + 8.
++ * Xriscos keyboard.
++ *
++ * Keys come from a KeyV handler in rwl's RMA block: every key going down or
++ * up, by RISC OS low-level key number, including modifiers on their own. They
++ * are queued only while the X window has the input focus. Each is mapped to
++ * its evdev (Linux) key code, which is what the precompiled keymaps use, so
++ * the X keycode is that plus 8 (minScanCode 0, KD_MIN_KEYCODE 8).
 + */
 +#ifdef HAVE_CONFIG_H
 +#include <kdrive-config.h>
 +#endif
++#include <rwl.h>
 +#include "riscos.h"
 +
 +KdKeyboardInfo *riscosKeyboard;
++Bool riscosKeyLog;
++
++/*
++ * RISC OS low-level key number -> evdev key code (0: none). The layout is by
++ * position: RISC OS reports which key, and XKB decides what it types, so a
++ * UK keyboard wants the "gb" keymap (-xkb-layout gb).
++ */
++static const unsigned char riscos_to_evdev[128] = {
++    /* 0x00 */  1,  59,  60,  61,  62,  63,  64,  65,   /* Esc, F1-F7 */
++    /* 0x08 */ 66,  67,  68,  87,  88,  99,  70, 119,   /* F8-F12, Print, Scroll, Break */
++    /* 0x10 */ 41,   2,   3,   4,   5,   6,   7,   8,   /* ` 1-7 */
++    /* 0x18 */  9,  10,  11,  12,  13,   0,  14, 110,   /* 8 9 0 - = (pound) Backspace Insert */
++    /* 0x20 */102, 104,  69,  98,  55,   0,  15,  16,   /* Home PgUp NumLock KP/ KP* (KP#) Tab Q */
++    /* 0x28 */ 17,  18,  19,  20,  21,  22,  23,  24,   /* W E R T Y U I O */
++    /* 0x30 */ 25,  26,  27,  43, 111, 107, 109,  71,   /* P [ ] \/# Delete End PgDn KP7 */
++    /* 0x38 */ 72,  73,  74,  29,  30,  31,  32,  33,   /* KP8 KP9 KP- LCtrl A S D F */
++    /* 0x40 */ 34,  35,  36,  37,  38,  39,  40,  28,   /* G H J K L ; ' Return */
++    /* 0x48 */ 75,  76,  77,  78,  42,  86,  44,  45,   /* KP4 KP5 KP6 KP+ LShift \(ISO) Z X */
++    /* 0x50 */ 46,  47,  48,  49,  50,  51,  52,  53,   /* C V B N M , . / */
++    /* 0x58 */ 54, 103,  79,  80,  81,  58,  56,  57,   /* RShift Up KP1 KP2 KP3 Caps LAlt Space */
++    /* 0x60 */100,  97, 105, 108, 106,  82,  83,  96,   /* RAlt RCtrl Left Down Right KP0 KP. KPEnter */
++    /* 0x68 */125, 126, 127,   0,   0,   0,   0,   0,   /* LWin RWin Menu */
++    /* 0x70 */  0,   0,   0,   0,   0,   0,   0,   0,   /* mouse buttons: not keys */
++    /* 0x78 */  0,   0,   0,   0,   0,   0,   0,   0,
++};
++
++/* Keys X has been told are down, by evdev code, so they can be released if
++   the window loses the focus while they are held. */
++static unsigned char key_down[256];
++
++/* Take the keys rwl has queued and pass them to X. Returns non-zero if any
++   were queued for X. */
++int
++riscosKeyEvents(void)
++{
++    int key, pressed, queued = 0;
++
++    while (rwl_key_next(&key, &pressed)) {
++        int code = key < 128 ? riscos_to_evdev[key] : 0;
++
++        if (riscosKeyLog)
++            ErrorF("Xriscos: key &%02X %s -> evdev %d\n",
++                   key, pressed ? "down" : "up", code);
++        if (code == 0 || !riscosKeyboard)
++            continue;
++        if (!pressed && !key_down[code])
++            continue;           /* pressed before we had the focus */
++        key_down[code] = pressed;
++        KdEnqueueKeyboardEvent(riscosKeyboard, code, !pressed);
++        queued = 1;
++    }
++    return queued;
++}
++
++/* The window lost the focus: let go of everything X thinks is held. */
++int
++riscosKeysReleaseAll(void)
++{
++    int code, queued = 0;
++
++    (void) riscosKeyEvents();
++    for (code = 0; code < 256; code++)
++        if (key_down[code]) {
++            key_down[code] = 0;
++            if (riscosKeyboard)
++                KdEnqueueKeyboardEvent(riscosKeyboard, code, TRUE);
++            queued = 1;
++        }
++    return queued;
++}
 +
 +static Status
 +RiscosKeyboardInit(KdKeyboardInfo * ki)
@@ -1095,12 +1194,41 @@
 +};
 --- a/hw/kdrive/riscos/riscosinit.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscosinit.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,150 @@
 +/* Xriscos: kdrive entry points. Based on hw/kdrive/fake/fakeinit.c. */
 +#ifdef HAVE_CONFIG_H
 +#include <kdrive-config.h>
 +#endif
 +#include "riscos.h"
++#include <kernel.h>
++#include <swis.h>
++
++extern const char *kdGlobalXkbLayout;
++
++/* The XKB layout for the RISC OS keyboard setting (OS_Byte 71, 255 reads the
++   keyboard's territory number), unless -xkb-layout chose one. Only layouts
++   with a precompiled keymap (xkb/make-xkm.sh) are worth naming here. */
++static void
++riscosDefaultLayout(void)
++{
++    int keyboard = 0;
++
++    if (kdGlobalXkbLayout)
++        return;
++    _swix(OS_Byte, _INR(0, 1) | _OUT(1), 71, 255, &keyboard);
++    switch (keyboard) {
++    case 1:
++        kdGlobalXkbLayout = "gb";
++        break;
++    case 48:
++        kdGlobalXkbLayout = "us";
++        break;
++    default:
++        LogMessage(X_INFO, "RISC OS keyboard %d: using the us keymap; "
++                   "choose another with -xkb-layout\n", keyboard);
++        break;
++    }
++}
 +
 +Bool riscosCardInit(KdCardInfo * card);
 +Bool riscosScreenInit(KdScreenInfo * screen);
@@ -1135,6 +1263,8 @@
 +    KdPointerInfo *pi;
 +    KdKeyboardInfo *ki;
 +
++    riscosDefaultLayout();
++
 +    pi = KdNewPointer();
 +    if (!pi)
 +        return;
@@ -1167,11 +1297,17 @@
 +ddxUseMsg(void)
 +{
 +    KdUseMsg();
++    ErrorF("\nXriscos options:\n");
++    ErrorF("-keylog                report each RISC OS key event and its mapping\n");
 +}
 +
 +int
 +ddxProcessArgument(int argc, char **argv, int i)
 +{
++    if (!strcmp(argv[i], "-keylog")) {
++        riscosKeyLog = TRUE;
++        return 1;
++    }
 +    return KdProcessArgument(argc, argv, i);
 +}
 +

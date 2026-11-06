@@ -12,9 +12,10 @@
 #include "rwl.h"
 
 /* Assembled into this program and copied to the RMA (rwl_event.s). */
-extern const char rwl_event_code[], rwl_event_code_end[];
+extern const char rwl_event_code[], rwl_key_code[], rwl_event_code_end[];
 
 #define EventV			0x10
+#define KeyV			0x13
 #define Event_Internet		19
 #define OSByte_DisableEvent	13
 #define OSByte_EnableEvent	14
@@ -37,10 +38,18 @@ extern const char rwl_event_code[], rwl_event_code_end[];
 #define BLK_POLLWORD	0
 #define BLK_EVENTS	1
 #define BLK_LASTSOCK	2
-#define BLK_CODE_OFF	12
+#define BLK_CAPTURE	3	/* bit 0: queue key events */
+#define BLK_RING_W	4	/* written by the KeyV handler */
+#define BLK_RING_R	5	/* written here */
+#define BLK_OVERFLOW	6
+#define BLK_RING	7	/* RING_SLOTS words */
+#define RING_SLOTS	32
+#define BLK_CODE_OFF	((BLK_RING + RING_SLOTS) * 4)	/* 156, as rwl_event.s */
+#define KEY_CODE_OFF	(BLK_CODE_OFF + (int) (rwl_key_code - rwl_event_code))
 
 static volatile int *blk;		/* RMA block, or NULL */
-static int vector_claimed, event_enabled, task_handle, quit_seen, at_exit_set;
+static int vector_claimed, key_vector_claimed, event_enabled, task_handle,
+    quit_seen, at_exit_set;
 static int poll_block[64];
 static struct rwl_stats st;
 static rwl_handler handler;
@@ -76,10 +85,17 @@ rwl_shutdown(void)
 		_swix(OS_Byte, _INR(0, 1), OSByte_DisableEvent, Event_Internet);
 		event_enabled = 0;
 	}
+	/* Free the block only once no vector points into it. If a release
+	   fails, leave it: a stray handler that writes to its own block is
+	   harmless, one in freed memory is not. */
+	if (key_vector_claimed) {
+		blk[BLK_CAPTURE] = 0;
+		if (_swix(OS_Release, _INR(0, 2), KeyV,
+			  (int) blk + KEY_CODE_OFF, (int) blk) != NULL)
+			return;
+		key_vector_claimed = 0;
+	}
 	if (vector_claimed) {
-		/* Free the block only once the vector no longer points into it. If
-		   the release fails, leave it: a stray handler that writes to its
-		   own block is harmless, one in freed memory is not. */
 		if (_swix(OS_Release, _INR(0, 2), EventV,
 			  (int) blk + BLK_CODE_OFF, (int) blk) != NULL)
 			return;
@@ -135,6 +151,10 @@ rwl_init(const char *task_name, const char **why)
 	blk[BLK_POLLWORD] = 0;
 	blk[BLK_EVENTS] = 0;
 	blk[BLK_LASTSOCK] = -1;
+	blk[BLK_CAPTURE] = 0;
+	blk[BLK_RING_W] = 0;
+	blk[BLK_RING_R] = 0;
+	blk[BLK_OVERFLOW] = 0;
 	memcpy((char *) mem + BLK_CODE_OFF, rwl_event_code, code_len);
 	TRACE("syncing code");
 	/* StrongARM has separate caches: the new code must reach the I-cache. */
@@ -149,6 +169,15 @@ rwl_init(const char *task_name, const char **why)
 		return -1;
 	}
 	vector_claimed = 1;
+
+	TRACE("claiming KeyV");
+	if ((e = _swix(OS_Claim, _INR(0, 2), KeyV, (int) mem + KEY_CODE_OFF,
+		       (int) mem)) != NULL) {
+		*why = e->errmess;
+		rwl_shutdown();
+		return -1;
+	}
+	key_vector_claimed = 1;
 
 	TRACE("enabling event 19");
 	_swix(OS_Byte, _INR(0, 1), OSByte_EnableEvent, Event_Internet);
@@ -230,7 +259,39 @@ take_pollword(void)
 	if (blk[BLK_POLLWORD] == 0)
 		return 0;
 	blk[BLK_POLLWORD] = 0;
+	/* The KeyV handler sets the pollword too: hand any keys over. */
+	if (blk[BLK_RING_R] != blk[BLK_RING_W] && handler != NULL)
+		(void) handler(RWL_REASON_KEYS, NULL, handler_data);
 	return 1;
+}
+
+void
+rwl_key_capture(int on)
+{
+	if (blk != NULL)
+		blk[BLK_CAPTURE] = on ? 1 : 0;
+}
+
+int
+rwl_key_next(int *key, int *pressed)
+{
+	int r;
+
+	if (blk == NULL)
+		return 0;
+	r = blk[BLK_RING_R];
+	if (r == blk[BLK_RING_W])
+		return 0;
+	*key = blk[BLK_RING + r] & 0xff;
+	*pressed = (blk[BLK_RING + r] >> 8) & 1;
+	blk[BLK_RING_R] = (r + 1) & (RING_SLOTS - 1);
+	return 1;
+}
+
+unsigned
+rwl_key_overflows(void)
+{
+	return blk != NULL ? (unsigned) blk[BLK_OVERFLOW] : 0;
 }
 
 enum rwl_result

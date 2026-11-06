@@ -32,8 +32,8 @@ in commit 800f1e4; details in `PORTING-NOTES.md`.
 `Wimp_Poll` between requests and keeps the desktop responsive under load.
 See `evloop/README.md`.
 
-**Phase 2, step 2 (Xriscos, the X screen in a desktop window): display and
-mouse work; keyboard not yet.** See "Xriscos" below.
+**Phase 2, step 2 (Xriscos, the X screen in a desktop window): display,
+mouse and keyboard work.** See "Xriscos" below.
 
 ## Xriscos
 
@@ -50,6 +50,13 @@ with `XDev.RunX` (640x480 by default; edit `XDev.StartX` for `-screen WxH` or
   of 256 colours or fewer.
 - While the pointer is over the window it is read every 20 ms: Select, Menu
   and Adjust are X buttons 1, 2 and 3. A click takes the input focus.
+- Keys come from a `KeyV` handler in rwl's RMA block: every physical key going
+  down or up, by RISC OS low-level key number, modifiers included. They are
+  captured only while the window has the caret, mapped to evdev key codes
+  (`hw/kdrive/riscos/kbd.c`), and XKB applies the layout. The layout defaults
+  from the RISC OS keyboard setting (`OS_Byte` 71: UK gives `gb`, USA `us`);
+  `-xkb-layout` overrides it. Losing the caret releases any keys X thinks are
+  held. `-keylog` (or `XDev.RunXtest`) logs each key and its mapping.
 - Closing the window, or Message_Quit, shuts the server down.
 - The window and sprite are kept across server resets.
 
@@ -59,8 +66,19 @@ three buttons, each press with its release, at the right coordinates; the
 window can be moved and redraws; closing it ends the server and its clients;
 it carries on across resets.
 
+Keyboard: `tools/keytest/keytest.py` sends 97 keys over VNC, one per physical
+key (letters, digits, punctuation, both ISO keys, F1-F12, editing and cursor
+keys, every modifier, the keypad), and checks `xev` gets each with the X
+keycode the emulator's own VNC table gives that key: all 97 correct, each with
+its release. Typed into an `xterm` with the `gb` layout, `|`, `\` and `£`
+come out right. Taking the caret away while Shift is held releases Shift in
+X, and the real release is not delivered twice.
+
 Not done yet:
-- Keyboard: keys typed into the window go back to the Wimp.
+- Keys for other windows (F12, hot keys) are not passed on while the X window
+  has the caret.
+- Only `us` and `gb` keymaps are precompiled; other territories fall back to
+  `us`.
 - Two pointers: X draws its own cursor into the sprite under the RISC OS one.
 - One size: no resizing and no RandR size changes.
 - The window opens over the icon bar on a small desktop.
@@ -81,6 +99,7 @@ Not done yet:
 | `libsha1/` | Minimal SHA-1 with the libsha1 API (tested against FIPS vectors) |
 | `xkb/make-xkm.sh` | Precompiles us/gb keymaps (evdev keycodes) on the build host |
 | `patches/` | Our changes to xorg-server 1.19.7, including the new `hw/kdrive/riscos` driver, as a diff |
+| `tools/keytest/` | Keyboard check: VNC key sender (`--type` too), the emulator's keysym table, and `keytest.py` |
 | `tools/` | `start-xvfb.sh`, `xping` (in-guest X handshake/GetImage test), `swicount.sh` (SWIs called from application space: shows busy-waiting), `waitdesk.sh`, VNC screenshot/click/key/mouse, CPU sampler |
 | `evloop/` | The Wimp_Poll event loop (`rwl`), its test task and results (Phase 2, step 1) |
 | `guest/` | RISC OS-side files for the machine's HostFS `XDev` folder: launchers (`RunX`, `RunXvfb`) and small BASIC helpers |
