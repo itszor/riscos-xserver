@@ -385,7 +385,7 @@
 +#endif
 --- a/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,774 @@
 +/*
 + * Xriscos: the kdrive X server for the RISC OS desktop.
 + *
@@ -398,6 +398,12 @@
 + *
 + * The window and sprite are made once and kept across server generations,
 + * since kdrive calls the card and screen functions again on every reset.
++ *
++ * Resizing the window resizes the X screen: once the window's size has been
++ * steady for RESIZE_SETTLE_MS, a work procedure swaps in a sprite of the new
++ * size and tells X and its clients (RandR), as Xephyr does for its host
++ * window. The work area is as big as the desktop, so the window can grow to
++ * that; it has no scroll bars, since the X screen always fills it.
 + *
 + * Based on hw/kdrive/fake (Keith Packard).
 + */
@@ -429,6 +435,11 @@
 +
 +/* How often the pointer is read while it is over the window. */
 +#define POINTER_POLL_MS         20
++/* A new window size must hold this long before the X screen follows it. */
++#define RESIZE_SETTLE_MS        250
++#define RESIZE_POLL_MS          50
++/* The smallest X screen the window can be made into, in pixels. */
++#define MIN_SIZE                64
 +/* Above this many damaged boxes, redraw their bounding box instead. */
 +#define MAX_REDRAW_BOXES        16
 +
@@ -454,9 +465,38 @@
 +    char title[64];
 +    /* pointer as last reported to X */
 +    int pointer_inside, last_x, last_y, last_buttons;
++    /* resizing */
++    ScreenPtr screen;           /* the X screen, once it exists */
++    int max_w, max_h;           /* largest X screen: the work area extent */
++    int pending_w, pending_h;   /* size the window has, X has not, or 0 */
++    long pending_since;         /* when the window last changed size */
++    int resize_queued;          /* a work procedure is due to resize */
 +} rd;
 +
 +static int riscosEvent(int reason, int *block, void *data);
++
++static long
++nowMs(void)
++{
++    int cs = 0;
++
++    _swix(OS_ReadMonotonicTime, _OUT(0), &cs);
++    return (long) cs * 10;
++}
++
++/* Null events are wanted while the pointer is over the window or a button
++   is held (tracking), and while a resize is waiting to settle. */
++static void
++riscosSetNullInterval(void)
++{
++    int ms = 0;
++
++    if (rd.pointer_inside || rd.last_buttons)
++        ms = POINTER_POLL_MS;
++    if (rd.pending_w && (ms == 0 || ms > RESIZE_POLL_MS))
++        ms = RESIZE_POLL_MS;
++    rwl_set_null_interval(ms);
++}
 +
 +static int
 +readModeVar(int var)
@@ -565,8 +605,15 @@
 +    int block[23], state[9];
 +    _kernel_oserror *e;
 +
++    /* The work area, and so the largest the X screen can become: the
++       desktop, or the size asked for if that is bigger. */
++    rd.max_w = rd.width > (screen_w >> rd.xeig) ? rd.width : screen_w >> rd.xeig;
++    rd.max_h = rd.height > (screen_h >> rd.yeig) ? rd.height : screen_h >> rd.yeig;
++
 +    snprintf(rd.title, sizeof rd.title, "X server %s (%dx%d)",
 +             display ? display : "", rd.width, rd.height);
++    memset(rd.title + strlen(rd.title), 0,
++           sizeof rd.title - strlen(rd.title));
 +    memset(block, 0, sizeof block);
 +    block[0] = 64;                      /* visible area */
 +    block[1] = screen_h - 96 - vh;
@@ -575,8 +622,9 @@
 +    block[4] = 0;                       /* scroll offsets */
 +    block[5] = 0;
 +    block[6] = -1;                      /* open on top */
-+    /* new-style flags: back, close, title, toggle, scroll bars, size; moveable */
-+    block[7] = (int) 0xff000002u;
++    /* new-style flags: back, close, title, toggle, size; moveable. No
++       scroll bars: the X screen follows the window's size. */
++    block[7] = (int) 0xbf000002u;
 +    ((char *) block)[32] = 7;           /* title foreground */
 +    ((char *) block)[33] = 2;           /* title background */
 +    ((char *) block)[34] = 7;           /* work area foreground */
@@ -585,16 +633,17 @@
 +    ((char *) block)[37] = 1;           /* scroll bar inner */
 +    ((char *) block)[38] = 12;          /* title background with focus */
 +    block[10] = 0;                      /* work area extent */
-+    block[11] = -h;
-+    block[12] = w;
++    block[11] = -(rd.max_h << rd.yeig);
++    block[12] = rd.max_w << rd.xeig;
 +    block[13] = 0;
 +    block[14] = 0x13d;                  /* title: indirected text, centred */
 +    block[15] = 10 << 12;               /* work area: click/drag buttons */
 +    block[16] = 1;                      /* sprite area: the Wimp's */
-+    block[17] = 0;                      /* minimum size: default */
++    /* minimum width and height, OS units, as two halfwords */
++    block[17] = (MIN_SIZE << rd.xeig) | ((MIN_SIZE << rd.yeig) << 16);
 +    block[18] = (int) rd.title;         /* indirected title */
 +    block[19] = -1;
-+    block[20] = (int) strlen(rd.title) + 1;
++    block[20] = (int) sizeof rd.title;  /* room for the size to change */
 +    block[21] = 0;                      /* no icons */
 +
 +    if ((e = _swix(Wimp_CreateWindow, _IN(1) | _OUT(0), block, &rd.window))) {
@@ -624,8 +673,25 @@
 +        int ox = block[1] - block[5];
 +        int oy = block[4] - block[6];
 +
++        int right = ox + (rd.width << rd.xeig);
++        int bottom = oy - (rd.height << rd.yeig);
++
 +        _swix(OS_SpriteOp, _INR(0, 7), 52 + 512, rd.area, rd.sprite,
-+              ox, oy - (rd.height << rd.yeig), 0, 0, rd.table);
++              ox, bottom, 0, 0, rd.table);
++        /* While a resize settles the window can be bigger than the X
++           screen: paint what the sprite does not cover black. block[7-10]
++           is the graphics window (inclusive). */
++        if (block[9] >= right || block[8] < bottom) {
++            _swix(ColourTrans_SetGCOL, _IN(0) | _INR(3, 4), 0, 0, 0);
++            if (block[9] >= right) {
++                _swix(OS_Plot, _INR(0, 2), 4, right, block[8]);
++                _swix(OS_Plot, _INR(0, 2), 96 + 5, block[9], block[10]);
++            }
++            if (block[8] < bottom) {
++                _swix(OS_Plot, _INR(0, 2), 4, block[7], block[8]);
++                _swix(OS_Plot, _INR(0, 2), 96 + 5, block[9], bottom - 1);
++            }
++        }
 +        e = _swix(Wimp_GetRectangle, _IN(1) | _OUT(0), block, &more);
 +    }
 +}
@@ -660,6 +726,118 @@
 +    return rd.pixels + row * rd.stride;
 +}
 +
++/* Put the size in the title and redraw the title bar. */
++static void
++riscosSetTitle(void)
++{
++    snprintf(rd.title, sizeof rd.title, "X server %s (%dx%d)",
++             display ? display : "", rd.width, rd.height);
++    if (rd.window)
++        _swix(Wimp_ForceRedraw, _INR(0, 4), -1, rd.vis[0], rd.vis[3],
++              rd.vis[2], rd.vis[3] + (24 << rd.yeig));
++}
++
++/* Make the X screen width x height: a new sprite, the screen pixmap moved
++   onto it, the root window resized (KdEnableScreen) and clients told. */
++static Bool
++riscosResizeScreen(ScreenPtr pScreen, int width, int height)
++{
++    KdScreenPriv(pScreen);
++    KdScreenInfo *screen = pScreenPriv->screen;
++    PixmapPtr pixmap = pScreen->GetScreenPixmap(pScreen);
++    Bool wasEnabled = pScreenPriv->enabled;
++    int old_w = screen->width, old_h = screen->height;
++
++    if (width == old_w && height == old_h)
++        return TRUE;
++    if (wasEnabled)
++        KdDisableScreen(pScreen);
++    shadowRemove(pScreen, pixmap);
++    if (!riscosMakeSprite(width, height, screen->fb.bitsPerPixel)) {
++        LogMessage(X_ERROR, "RISC OS: no memory for a %dx%d screen\n",
++                   width, height);
++        shadowAdd(pScreen, pixmap, riscosShadowUpdate, riscosWindowLinear,
++                  0, NULL);
++        if (wasEnabled)
++            KdEnableScreen(pScreen);
++        return FALSE;
++    }
++    screen->width = width;
++    screen->height = height;
++    screen->fb.frameBuffer = rd.pixels;
++    screen->fb.byteStride = rd.stride;
++    screen->fb.pixelStride = rd.stride * 8 / screen->fb.bitsPerPixel;
++    /* same resolution: the physical size scales with the pixels */
++    pScreen->mmWidth = pScreen->mmWidth * width / old_w;
++    pScreen->mmHeight = pScreen->mmHeight * height / old_h;
++    screen->width_mm = pScreen->mmWidth;
++    screen->height_mm = pScreen->mmHeight;
++    pScreen->width = width;
++    pScreen->height = height;
++    (*pScreen->ModifyPixmapHeader) (pixmap, width, height, screen->fb.depth,
++                                    screen->fb.bitsPerPixel, rd.stride,
++                                    rd.pixels);
++    shadowAdd(pScreen, pixmap, riscosShadowUpdate, riscosWindowLinear, 0, NULL);
++    if (wasEnabled)
++        KdEnableScreen(pScreen);
++#ifdef RANDR
++    RRScreenSizeNotify(pScreen);
++#endif
++    riscosSetTitle();
++    LogMessage(X_INFO, "RISC OS: screen resized to %dx%d\n", width, height);
++    return TRUE;
++}
++
++/* Run from the server's work queue, outside any request. */
++static Bool
++riscosResizeWork(ClientPtr client, void *closure)
++{
++    rd.resize_queued = 0;
++    if (rd.screen)
++        (void) riscosResizeScreen(rd.screen, (int) (long) closure >> 16,
++                                  (int) (long) closure & 0xffff);
++    return TRUE;
++}
++
++/* The window's size, in X pixels, changed: remember it for later. */
++static void
++riscosWindowSized(void)
++{
++    int w = (rd.vis[2] - rd.vis[0]) >> rd.xeig;
++    int h = (rd.vis[3] - rd.vis[1]) >> rd.yeig;
++
++    if (w < MIN_SIZE) w = MIN_SIZE;
++    if (h < MIN_SIZE) h = MIN_SIZE;
++    if (w > rd.max_w) w = rd.max_w;
++    if (h > rd.max_h) h = rd.max_h;
++    if (w == rd.width && h == rd.height) {
++        rd.pending_w = rd.pending_h = 0;
++    }
++    else if (w != rd.pending_w || h != rd.pending_h) {
++        rd.pending_w = w;
++        rd.pending_h = h;
++        rd.pending_since = nowMs();
++    }
++    riscosSetNullInterval();
++}
++
++/* Once a new size has settled, queue the resize. Returns non-zero if it
++   queued one, to wake the server. */
++static int
++riscosCheckResize(void)
++{
++    if (!rd.pending_w || rd.resize_queued || !rd.screen)
++        return 0;
++    if (nowMs() - rd.pending_since < RESIZE_SETTLE_MS)
++        return 0;
++    rd.resize_queued = 1;
++    QueueWorkProc(riscosResizeWork, NULL,
++                  (void *) (long) ((rd.pending_w << 16) | rd.pending_h));
++    rd.pending_w = rd.pending_h = 0;
++    riscosSetNullInterval();
++    return 1;
++}
++
 +/* Read the pointer and queue an X event if it moved or a button changed. */
 +int
 +riscosPollPointer(void)
@@ -690,7 +868,10 @@
 +    if (buttons & 1) flags |= KD_BUTTON_3;
 +    rd.last_x = x;
 +    rd.last_y = y;
-+    rd.last_buttons = buttons;
++    if (buttons != rd.last_buttons) {
++        rd.last_buttons = buttons;
++        riscosSetNullInterval();        /* a drag may have ended outside */
++    }
 +    KdEnqueuePointerEvent(riscosPointer, flags, x, y, 0);
 +    return 1;
 +}
@@ -700,16 +881,27 @@
 +riscosEvent(int reason, int *block, void *data)
 +{
 +    switch (reason) {
-+    case 0:                             /* null: pointer tracking */
-+        return riscosPollPointer();
++    case 0:                             /* null: pointer tracking, resizing */
++    {
++        int woken = riscosCheckResize();
++
++        if (rd.pointer_inside || rd.last_buttons)
++            woken |= riscosPollPointer();
++        return woken;
++    }
 +    case Redraw_Window_Request:
 +        if (block[0] == rd.window)
 +            riscosRedraw(block, FALSE);
 +        return 0;
 +    case Open_Window_Request:
 +        if (block[0] == rd.window) {
++            /* RISC OS 3.7 draws a vertical scroll bar alongside the size
++               icon; keep it inert, since the X screen fills the window. */
++            block[5] = 0;
++            block[6] = 0;
 +            _swix(Wimp_OpenWindow, _IN(1), block);
 +            riscosReadWindowState();
++            riscosWindowSized();
 +        }
 +        return 0;
 +    case Close_Window_Request:
@@ -724,16 +916,14 @@
 +            return 0;
 +        rd.pointer_inside = 1;
 +        riscosCursorEnter(rd.xeig, rd.yeig);
-+        rwl_set_null_interval(POINTER_POLL_MS);
++        riscosSetNullInterval();
 +        return riscosPollPointer();
 +    case Pointer_Leaving_Window:
 +        if (block[0] != rd.window)
 +            return 0;
 +        rd.pointer_inside = 0;
 +        riscosCursorLeave();
-+        /* Keep polling while a button is held, for drags. */
-+        if (rd.last_buttons == 0)
-+            rwl_set_null_interval(0);
++        riscosSetNullInterval();        /* still polled while a button is held */
 +        return riscosPollPointer();
 +    case Mouse_Click:
 +        if (block[3] == rd.window) {
@@ -907,6 +1097,7 @@
 +Bool
 +riscosCreateResources(ScreenPtr pScreen)
 +{
++    rd.screen = pScreen;
 +    /* Damage tracking only: the update tells the Wimp what changed. */
 +    return shadowAdd(pScreen, pScreen->GetScreenPixmap(pScreen),
 +                     riscosShadowUpdate, riscosWindowLinear, 0, NULL);

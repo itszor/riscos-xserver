@@ -44,7 +44,13 @@ with `XDev.RunX` (640x480 by default; edit `XDev.StartX` for `-screen WxH` or
 - The X screen is a RISC OS sprite, 16bpp (X depth 15) or 32bpp (depth 24),
   which fb draws into directly: the X visual's masks follow RISC OS's pixel
   layout (red in the low bits), so nothing is converted.
-- It is shown in an ordinary window (title, close, back, toggle, scroll bars).
+- It is shown in an ordinary window (title, close, back, toggle, size).
+  Resizing the window resizes the X screen: once the size has held for
+  250 ms, a work procedure swaps in a sprite of the new size, resizes the root
+  window and tells clients (RandR), as Xephyr does. The window can grow to the
+  size of the desktop (or the starting size, if bigger), and shrink to 64x64.
+  RISC OS 3.70 draws a vertical scroll bar beside the size icon whatever the
+  flags say; it is kept from scrolling.
   The shadow layer's damage becomes `Wimp_ForceRedraw`; redraw requests plot
   the sprite with `OS_SpriteOp` 52, through a ColourTrans table on a desktop
   of 256 colours or fewer.
@@ -81,6 +87,12 @@ its release. Typed into an `xterm` with the `gb` layout, `|`, `\` and `£`
 come out right. Taking the caret away while Shift is held releases Shift in
 X, and the real release is not delivered twice.
 
+Resizing: dragging the size icon took the X screen from 640x480 to 440x343
+and then 719x519, with the title, `xdpyinfo`, `xrandr` and a client polling
+`xwininfo -root` all following; the toggle icon gave the full 779x579. Clients
+redraw on the exposures; windows left outside a smaller screen are not moved
+(there is no window manager).
+
 Pointer: over an `xterm` the pointer is X's I-beam, over the root the X
 cursor, and off the window the RISC OS arrow with its own colours, with
 nothing drawn into the window. `xsetroot` with a core red-on-yellow `watch`
@@ -96,7 +108,8 @@ Not done yet:
 - Full-colour cursors are reduced to three colours, and cursors over 32x32
   are clipped.
 - X pointer warps (`XWarpPointer`) do not move the RISC OS pointer.
-- One size: no resizing and no RandR size changes.
+- RandR offers only the current size: clients cannot change it (`xrandr -s`);
+  the window decides.
 - The window opens over the icon bar on a small desktop.
 - Untested on 256-colour and 32bpp desktops.
 
