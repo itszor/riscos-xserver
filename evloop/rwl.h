@@ -18,6 +18,7 @@ enum rwl_result {
 	RWL_READY = 1,		/* a socket event arrived since the last wait */
 	RWL_TIMEOUT = 2,	/* the timeout passed with no socket event */
 	RWL_QUIT = 3,		/* the Wimp asked the task to quit */
+	RWL_EVENT = 4,		/* the event handler reported work for the caller */
 	RWL_ERROR = -1
 };
 
@@ -32,8 +33,27 @@ struct rwl_stats {
 };
 
 /* Start the Wimp task and install the event handler. Returns 0 on success,
-   or -1 with a message (static storage) in *why. */
+   or -1 with a message (static storage) in *why. A second call does nothing
+   and returns 0. */
 int rwl_init(const char *task_name, const char **why);
+
+/* The Wimp task handle, or 0 before rwl_init(). */
+int rwl_task_handle(void);
+
+/*
+ * Wimp events for the caller. Every reason rwl does not consume itself goes to
+ * the handler: redraw, open, close, pointer, mouse, keys, caret, and messages
+ * (17-19, after rwl has checked them for Message_Quit). Null events (reason 0)
+ * go to it only while a null interval is set. block is Wimp_Poll's block.
+ * The handler returns non-zero when it has queued work for the caller, which
+ * makes rwl_wait() return RWL_EVENT.
+ */
+typedef int (*rwl_handler)(int reason, int *block, void *data);
+void rwl_set_handler(rwl_handler fn, void *data);
+
+/* Ask for a null event at least every ms milliseconds (0: none), for polling
+   that has no event of its own, such as tracking the pointer. */
+void rwl_set_null_interval(int ms);
 
 /* Put a socket in async, non-blocking mode so it wakes rwl_wait(). */
 int rwl_watch_socket(int fd);

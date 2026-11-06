@@ -32,6 +32,40 @@ in commit 800f1e4; details in `PORTING-NOTES.md`.
 `Wimp_Poll` between requests and keeps the desktop responsive under load.
 See `evloop/README.md`.
 
+**Phase 2, step 2 (Xriscos, the X screen in a desktop window): display and
+mouse work; keyboard not yet.** See "Xriscos" below.
+
+## Xriscos
+
+A kdrive server (`hw/kdrive/riscos`, built with `--enable-xriscos`). Start it
+with `XDev.RunX` (640x480 by default; edit `XDev.StartX` for `-screen WxH` or
+`WxHx24`).
+
+- The X screen is a RISC OS sprite, 16bpp (X depth 15) or 32bpp (depth 24),
+  which fb draws into directly: the X visual's masks follow RISC OS's pixel
+  layout (red in the low bits), so nothing is converted.
+- It is shown in an ordinary window (title, close, back, toggle, scroll bars).
+  The shadow layer's damage becomes `Wimp_ForceRedraw`; redraw requests plot
+  the sprite with `OS_SpriteOp` 52, through a ColourTrans table on a desktop
+  of 256 colours or fewer.
+- While the pointer is over the window it is read every 20 ms: Select, Menu
+  and Adjust are X buttons 1, 2 and 3. A click takes the input focus.
+- Closing the window, or Message_Quit, shuts the server down.
+- The window and sprite are kept across server resets.
+
+Tested on "My RiscPC" (16bpp desktop): `xlogo`, `xeyes`, `xclock -update 1`
+and a coloured `xterm` from Linux draw correctly; `xev` sees motion and all
+three buttons, each press with its release, at the right coordinates; the
+window can be moved and redraws; closing it ends the server and its clients;
+it carries on across resets.
+
+Not done yet:
+- Keyboard: keys typed into the window go back to the Wimp.
+- Two pointers: X draws its own cursor into the sprite under the RISC OS one.
+- One size: no resizing and no RandR size changes.
+- The window opens over the icon bar on a small desktop.
+- Untested on 256-colour and 32bpp desktops.
+
 ## Layout
 
 | Path | What |
@@ -41,14 +75,15 @@ See `evloop/README.md`.
 | `build-deps.sh` | Cross-builds zlib, libsha1, xorgproto, xtrans, libXau, libfontenc, libXfont2, pixman into `prefix/` |
 | `build-xserver.sh` | Configures and builds xorg-server (Xvfb only for now) |
 | `build-sul.sh` | Builds the SharedUnixLibrary module RISC OS 3.70 needs, from a GCCSDK clone |
-| `stage-xvfb.sh` | Rebuild, convert to AIF, copy to the machine's HostFS |
+| `stage.sh` | Rebuild, convert Xvfb and Xriscos to AIF, copy them and `guest/` to the machine's HostFS |
+| `make-patch.sh` | Regenerate `patches/` from the edited tree in `build/` and check it reproduces it |
 | `compat/riscos-compat.h` | Force-included header filling UnixLib gaps |
 | `libsha1/` | Minimal SHA-1 with the libsha1 API (tested against FIPS vectors) |
 | `xkb/make-xkm.sh` | Precompiles us/gb keymaps (evdev keycodes) on the build host |
-| `patches/` | Our changes to xorg-server 1.19.7, as a diff |
-| `tools/` | `start-xvfb.sh`, `xping` (in-guest X handshake/GetImage test), `swicount.sh` (SWIs called from application space: shows busy-waiting), `waitdesk.sh`, VNC screenshot/click/key, CPU sampler |
+| `patches/` | Our changes to xorg-server 1.19.7, including the new `hw/kdrive/riscos` driver, as a diff |
+| `tools/` | `start-xvfb.sh`, `xping` (in-guest X handshake/GetImage test), `swicount.sh` (SWIs called from application space: shows busy-waiting), `waitdesk.sh`, VNC screenshot/click/key/mouse, CPU sampler |
 | `evloop/` | The Wimp_Poll event loop (`rwl`), its test task and results (Phase 2, step 1) |
-| `guest/` | RISC OS-side files for the machine's HostFS `XDev` folder: the Xvfb launcher and small BASIC helpers |
+| `guest/` | RISC OS-side files for the machine's HostFS `XDev` folder: launchers (`RunX`, `RunXvfb`) and small BASIC helpers |
 | `phase0/` | Toolchain smoke test |
 | `sources/SHA256SUMS` | Checksums of the upstream tarballs (the tarballs themselves are not in git) |
 
@@ -61,7 +96,7 @@ docker run --rm -u $(id -u):$(id -g) -v "$PWD":/xdev xdev-gccsdk:1 /xdev/build-d
 docker run --rm -u $(id -u):$(id -g) -v "$PWD":/xdev xdev-gccsdk:1 /xdev/xkb/make-xkm.sh
 docker run --rm -u $(id -u):$(id -g) -v "$PWD":/xdev xdev-gccsdk:1 /xdev/build-xserver.sh
 ./build-sul.sh                           # SharedULib,ffa into stage/
-./stage-xvfb.sh
+./stage.sh
 tools/start-xvfb.sh                      # emulator must be running
 DISPLAY=localhost:100 xdpyinfo           # NAT forward host 6100 -> guest 6000
 ```

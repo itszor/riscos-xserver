@@ -36,12 +36,24 @@ cp "$XDEV/evloop/rwl.h" "$PREFIX/include/"
 
 cd "$SRC"
 
+# Our patches change configure.ac and Makefile.am files (the Xriscos server),
+# so regenerate the build system whenever one is newer than configure.
+if [ -n "$(find . -name configure.ac -newer configure -o -name Makefile.am -newer configure | head -1)" ]; then
+    echo "==> autoreconf"
+    ACLOCAL_PATH=$PREFIX/share/aclocal:/usr/share/aclocal autoreconf -fi \
+        > "$LOGS/xserver.autoreconf.log" 2>&1 || { tail -20 "$LOGS/xserver.autoreconf.log"; exit 1; }
+    what=all
+fi
+
 if [ "$what" = configure ] || [ "$what" = all ]; then
     echo "==> configure"
     ./configure --host=$HOST --prefix=/X11 \
         --disable-shared --enable-static \
         --disable-xorg --disable-dmx --disable-xnest --disable-xquartz \
-        --disable-xwin --disable-xwayland --disable-kdrive --disable-xephyr \
+        --disable-xwin --disable-xwayland --disable-xephyr \
+        --enable-kdrive --enable-xriscos --disable-xfake --disable-xfbdev \
+        --disable-kdrive-kbd --disable-kdrive-mouse --disable-kdrive-evdev \
+        --disable-tslib \
         --enable-xvfb \
         --disable-glx --disable-dri --disable-dri2 --disable-dri3 \
         --disable-libdrm --disable-glamor --disable-present \
@@ -71,5 +83,5 @@ if [ "$what" = make ] || [ "$what" = all ]; then
     make -j"$(nproc)" -k CPPFLAGS="$COMPAT_CPPFLAGS" LDFLAGS="-L$PREFIX/lib -all-static" LIBS="-lrwl" > "$LOGS/xserver.make.log" 2>&1 || {
         grep -E 'error:|Error [0-9]|undefined reference' "$LOGS/xserver.make.log" | sort | uniq -c | sort -rn | head -60
         exit 1; }
-    ls -l hw/vfb/Xvfb
+    ls -l hw/vfb/Xvfb hw/kdrive/riscos/Xriscos
 fi

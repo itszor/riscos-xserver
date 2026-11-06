@@ -236,3 +236,976 @@
  Bool SmartScheduleSignalEnable = SMART_SCHEDULE_DEFAULT_SIGNAL_ENABLE;
  #endif
  
+--- a/configure.ac	2019-03-02 22:12:45.000000000 +0000
++++ b/configure.ac	2026-11-06 14:10:53.242318698 +0000
+@@ -660,6 +660,7 @@
+ AC_ARG_ENABLE(kdrive,         AS_HELP_STRING([--enable-kdrive], [Build kdrive servers (default: no)]), [KDRIVE=$enableval], [KDRIVE=no])
+ AC_ARG_ENABLE(xephyr,         AS_HELP_STRING([--enable-xephyr], [Build the kdrive Xephyr server (default: auto)]), [XEPHYR=$enableval], [XEPHYR=auto])
+ AC_ARG_ENABLE(xfake,          AS_HELP_STRING([--enable-xfake], [Build the kdrive 'fake' server (default: auto)]), [XFAKE=$enableval], [XFAKE=auto])
++AC_ARG_ENABLE(xriscos,        AS_HELP_STRING([--enable-xriscos], [Build the kdrive RISC OS desktop server (default: no)]), [XRISCOS=$enableval], [XRISCOS=no])
+ AC_ARG_ENABLE(xfbdev,         AS_HELP_STRING([--enable-xfbdev], [Build the kdrive framebuffer device server (default: auto)]), [XFBDEV=$enableval], [XFBDEV=auto])
+ dnl kdrive options
+ AC_ARG_ENABLE(kdrive-kbd,     AS_HELP_STRING([--enable-kdrive-kbd], [Build kbd driver for kdrive (default: auto)]), [KDRIVE_KBD=$enableval], [KDRIVE_KBD=auto])
+@@ -2507,6 +2508,7 @@
+ AM_CONDITIONAL(XEPHYR, [test "x$KDRIVE" = xyes && test "x$XEPHYR" = xyes])
+ AM_CONDITIONAL(BUILD_KDRIVEFBDEVLIB, [test "x$KDRIVE" = xyes && test "x$KDRIVEFBDEVLIB" = xyes])
+ AM_CONDITIONAL(XFAKESERVER, [test "x$KDRIVE" = xyes && test "x$XFAKE" = xyes])
++AM_CONDITIONAL(XRISCOSSERVER, [test "x$KDRIVE" = xyes && test "x$XRISCOS" = xyes])
+ 
+ dnl Xwayland DDX
+ 
+@@ -2689,6 +2691,7 @@
+ hw/kdrive/ephyr/Makefile
+ hw/kdrive/ephyr/man/Makefile
+ hw/kdrive/fake/Makefile
++hw/kdrive/riscos/Makefile
+ hw/kdrive/fbdev/Makefile
+ hw/kdrive/linux/Makefile
+ hw/kdrive/src/Makefile
+--- a/hw/kdrive/Makefile.am	2019-02-02 09:35:15.000000000 +0000
++++ b/hw/kdrive/Makefile.am	2026-11-06 14:10:53.242544269 +0000
+@@ -10,6 +10,10 @@
+ XEPHYR_SUBDIRS = ephyr
+ endif
+ 
++if XRISCOSSERVER
++XRISCOS_SUBDIRS = riscos
++endif
++
+ if KDRIVELINUX
+ LINUX_SUBDIRS = linux
+ endif
+@@ -17,14 +21,15 @@
+ SERVER_SUBDIRS = 		\
+ 	$(FBDEV_SUBDIRS)	\
+ 	$(XEPHYR_SUBDIRS)       \
+-	$(XFAKE_SUBDIRS)
++	$(XFAKE_SUBDIRS)		\
++	$(XRISCOS_SUBDIRS)
+ 
+ SUBDIRS =			\
+ 	src			\
+ 	$(LINUX_SUBDIRS)	\
+ 	$(SERVER_SUBDIRS)
+ 
+-DIST_SUBDIRS = fbdev ephyr src linux fake
++DIST_SUBDIRS = fbdev ephyr src linux fake riscos
+ 
+ relink:
+ 	$(AM_V_at)for i in $(SERVER_SUBDIRS) ; do $(MAKE) -C $$i relink || exit 1 ; done
+--- a/hw/kdrive/riscos/Makefile.am	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/Makefile.am	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,33 @@
++# Xriscos: the kdrive X server for the RISC OS desktop. The X screen is a
++# sprite shown in a Wimp window; see riscos.c.
++AM_CPPFLAGS = 					\
++	@KDRIVE_INCS@				\
++	@KDRIVE_CFLAGS@
++
++noinst_LTLIBRARIES = libriscos.la
++
++bin_PROGRAMS = Xriscos
++
++libriscos_la_SOURCES =	\
++	riscos.c	\
++	riscos.h	\
++	mouse.c		\
++	kbd.c		\
++	os.c
++
++Xriscos_SOURCES = \
++	riscosinit.c
++
++Xriscos_LDADD = 					\
++	libriscos.la					\
++	@KDRIVE_MAIN_LIB@				\
++	@KDRIVE_LIBS@
++
++Xriscos_LDFLAGS = $(LD_EXPORT_SYMBOLS_FLAG)
++
++Xriscos_DEPENDENCIES =	\
++	libriscos.la					\
++	@KDRIVE_LOCAL_LIBS@
++
++relink:
++	$(AM_V_at)rm -f $(bin_PROGRAMS) && $(MAKE) $(bin_PROGRAMS)
+--- a/hw/kdrive/riscos/riscos.h	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/riscos.h	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,37 @@
++/*
++ * Xriscos: the kdrive X server for the RISC OS desktop.
++ *
++ * The X screen is a RISC OS sprite that fb draws into directly, shown in a
++ * Wimp window. Changes reach the window through the shadow layer's damage
++ * tracking (Wimp_ForceRedraw); the Wimp's redraw requests plot the sprite.
++ * The server is a Wimp task through rwl (the port's evloop/), which delivers
++ * the Wimp events this driver handles.
++ */
++#ifndef _RISCOS_H_
++#define _RISCOS_H_
++#include <stdio.h>
++#include <unistd.h>
++#include "kdrive.h"
++#ifdef RANDR
++#include "randrstr.h"
++#endif
++
++typedef struct _riscosScrPriv {
++    Rotation randr;
++} RiscosScrPriv;
++
++extern KdCardFuncs riscosFuncs;
++extern KdPointerDriver RiscosPointerDriver;
++extern KdKeyboardDriver RiscosKeyboardDriver;
++extern KdOsFuncs RiscosOsFuncs;
++
++/* The pointer device, once enabled, for riscos.c to queue events on. */
++extern KdPointerInfo *riscosPointer;
++/* The keyboard device, once enabled. */
++extern KdKeyboardInfo *riscosKeyboard;
++
++/* Track the pointer over the window and queue X events for any change.
++   Returns non-zero if an event was queued. */
++int riscosPollPointer(void);
++
++#endif
+--- a/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,565 @@
++/*
++ * Xriscos: the kdrive X server for the RISC OS desktop.
++ *
++ * The X screen is a 16bpp (or 32bpp) RISC OS sprite. fb draws straight into
++ * the sprite's pixels: RISC OS keeps red in the low bits, so the X visual's
++ * masks are chosen to match and nothing is converted. The sprite is shown in a
++ * Wimp window. The shadow layer's damage tracking turns each change into
++ * Wimp_ForceRedraw; the Wimp then asks for the area to be redrawn and the
++ * sprite is plotted with OS_SpriteOp PutSpriteScaled.
++ *
++ * The window and sprite are made once and kept across server generations,
++ * since kdrive calls the card and screen functions again on every reset.
++ *
++ * Based on hw/kdrive/fake (Keith Packard).
++ */
++#ifdef HAVE_CONFIG_H
++#include <kdrive-config.h>
++#endif
++#include <signal.h>
++#include <string.h>
++#include <kernel.h>
++#include <swis.h>
++#include <rwl.h>
++#include "riscos.h"
++#include "shadow.h"
++#include "opaque.h"             /* display */
++
++/* Wimp event reason codes and messages */
++#define Redraw_Window_Request   1
++#define Open_Window_Request     2
++#define Close_Window_Request    3
++#define Pointer_Leaving_Window  4
++#define Pointer_Entering_Window 5
++#define Mouse_Click             6
++#define Key_Pressed             8
++#define User_Message            17
++#define User_Message_Recorded   18
++#define Message_ModeChange      0x400c1
++
++/* How often the pointer is read while it is over the window. */
++#define POINTER_POLL_MS         20
++/* Above this many damaged boxes, redraw their bounding box instead. */
++#define MAX_REDRAW_BOXES        16
++
++/* OS_ReadModeVariable numbers */
++#define VAR_XEIG        4
++#define VAR_YEIG        5
++#define VAR_LOG2BPP     9
++#define VAR_XWINDLIMIT  11
++#define VAR_YWINDLIMIT  12
++
++/* The desktop side: one window showing one sprite, for the whole run. */
++static struct {
++    int window;                 /* Wimp window handle, 0 until made */
++    int width, height, bpp;     /* the sprite, in pixels */
++    int *area;                  /* sprite area holding the one sprite */
++    int *sprite;                /* the sprite header */
++    CARD8 *pixels;              /* its image: the X framebuffer */
++    int stride;                 /* bytes per row */
++    int xeig, yeig;             /* desktop mode: OS units = pixels << eig */
++    int desk_log2bpp;
++    void *table;                /* ColourTrans table, for desktops <= 8bpp */
++    int vis[4], scroll[2];      /* window's visible area and scroll offsets */
++    char title[64];
++    /* pointer as last reported to X */
++    int pointer_inside, last_x, last_y, last_buttons;
++} rd;
++
++static int riscosEvent(int reason, int *block, void *data);
++
++static int
++readModeVar(int var)
++{
++    int value = 0;
++
++    _swix(OS_ReadModeVariable, _INR(0, 1) | _OUT(2), -1, var, &value);
++    return value;
++}
++
++/* (Re)build the colour translation for the current desktop mode. A 16bpp or
++   32bpp desktop plots the sprite as it is; a palette mode needs a table. */
++static void
++riscosReadMode(void)
++{
++    int size = 0;
++
++    rd.xeig = readModeVar(VAR_XEIG);
++    rd.yeig = readModeVar(VAR_YEIG);
++    rd.desk_log2bpp = readModeVar(VAR_LOG2BPP);
++    free(rd.table);
++    rd.table = NULL;
++    if (rd.area && rd.desk_log2bpp <= 3) {
++        /* r5 bit 0: r0, r1 give the source as a sprite area and sprite */
++        if (_swix(ColourTrans_SelectTable, _INR(0, 5) | _OUT(4),
++                  rd.area, rd.sprite, -1, -1, 0, 1, &size) == NULL &&
++            size > 0 && (rd.table = malloc(size)) != NULL) {
++            if (_swix(ColourTrans_SelectTable, _INR(0, 5),
++                      rd.area, rd.sprite, -1, -1, rd.table, 1) != NULL) {
++                free(rd.table);
++                rd.table = NULL;
++            }
++        }
++        if (!rd.table)
++            LogMessage(X_WARNING, "RISC OS: no colour table for this "
++                       "%d-colour desktop; colours will be wrong\n",
++                       1 << (1 << rd.desk_log2bpp));
++    }
++}
++
++/* Make the sprite that is the X framebuffer. */
++static Bool
++riscosMakeSprite(int width, int height, int bpp)
++{
++    int stride = ((width * bpp + 31) >> 5) << 2;
++    int image = stride * height;
++    int total = 16 + 44 + image;
++    int type = (bpp == 32) ? 6 : 5;
++    int xdpi = 180 >> rd.xeig, ydpi = 180 >> rd.yeig;
++    int *area, *s;
++
++    if (rd.area && rd.width == width && rd.height == height && rd.bpp == bpp)
++        return TRUE;
++    area = calloc(1, total);
++    if (!area)
++        return FALSE;
++    area[0] = total;            /* sprite area: size */
++    area[1] = 1;                /* number of sprites */
++    area[2] = 16;               /* offset to the first */
++    area[3] = total;            /* offset to free space */
++    s = area + 4;
++    s[0] = 44 + image;          /* offset to the next sprite */
++    strncpy((char *) &s[1], "xscreen", 12);
++    s[4] = stride / 4 - 1;      /* width in words, less one */
++    s[5] = height - 1;          /* height in rows, less one */
++    s[6] = 0;                   /* first bit used */
++    s[7] = (width * bpp - 1) & 31;      /* last bit used in the last word */
++    s[8] = 44;                  /* offset to the image */
++    s[9] = 44;                  /* offset to the mask: none */
++    s[10] = (type << 27) | (ydpi << 14) | (xdpi << 1) | 1;     /* mode word */
++
++    free(rd.area);
++    rd.area = area;
++    rd.sprite = s;
++    rd.pixels = (CARD8 *) s + 44;
++    rd.stride = stride;
++    rd.width = width;
++    rd.height = height;
++    rd.bpp = bpp;
++    riscosReadMode();
++    return TRUE;
++}
++
++static void
++riscosReadWindowState(void)
++{
++    int block[9];
++
++    block[0] = rd.window;
++    if (_swix(Wimp_GetWindowState, _IN(1), block) == NULL) {
++        memcpy(rd.vis, &block[1], sizeof rd.vis);
++        rd.scroll[0] = block[5];
++        rd.scroll[1] = block[6];
++    }
++}
++
++/* Make and open the window, once. */
++static Bool
++riscosMakeWindow(void)
++{
++    int w = rd.width << rd.xeig, h = rd.height << rd.yeig;
++    int screen_w = (readModeVar(VAR_XWINDLIMIT) + 1) << rd.xeig;
++    int screen_h = (readModeVar(VAR_YWINDLIMIT) + 1) << rd.yeig;
++    int vw = w < screen_w - 128 ? w : screen_w - 128;
++    int vh = h < screen_h - 192 ? h : screen_h - 192;
++    int block[23], state[9];
++    _kernel_oserror *e;
++
++    snprintf(rd.title, sizeof rd.title, "X server %s (%dx%d)",
++             display ? display : "", rd.width, rd.height);
++    memset(block, 0, sizeof block);
++    block[0] = 64;                      /* visible area */
++    block[1] = screen_h - 96 - vh;
++    block[2] = 64 + vw;
++    block[3] = screen_h - 96;
++    block[4] = 0;                       /* scroll offsets */
++    block[5] = 0;
++    block[6] = -1;                      /* open on top */
++    /* new-style flags: back, close, title, toggle, scroll bars, size; moveable */
++    block[7] = (int) 0xff000002u;
++    ((char *) block)[32] = 7;           /* title foreground */
++    ((char *) block)[33] = 2;           /* title background */
++    ((char *) block)[34] = 7;           /* work area foreground */
++    ((char *) block)[35] = (char) 0xff; /* work area background: we paint it all */
++    ((char *) block)[36] = 3;           /* scroll bar outer */
++    ((char *) block)[37] = 1;           /* scroll bar inner */
++    ((char *) block)[38] = 12;          /* title background with focus */
++    block[10] = 0;                      /* work area extent */
++    block[11] = -h;
++    block[12] = w;
++    block[13] = 0;
++    block[14] = 0x13d;                  /* title: indirected text, centred */
++    block[15] = 10 << 12;               /* work area: click/drag buttons */
++    block[16] = 1;                      /* sprite area: the Wimp's */
++    block[17] = 0;                      /* minimum size: default */
++    block[18] = (int) rd.title;         /* indirected title */
++    block[19] = -1;
++    block[20] = (int) strlen(rd.title) + 1;
++    block[21] = 0;                      /* no icons */
++
++    if ((e = _swix(Wimp_CreateWindow, _IN(1) | _OUT(0), block, &rd.window))) {
++        LogMessage(X_ERROR, "RISC OS: cannot create the window: %s\n",
++                   e->errmess);
++        return FALSE;
++    }
++    state[0] = rd.window;
++    _swix(Wimp_GetWindowState, _IN(1), state);
++    state[7] = -1;
++    _swix(Wimp_OpenWindow, _IN(1), state);
++    riscosReadWindowState();
++    return TRUE;
++}
++
++/* Plot the sprite in answer to a redraw request (or an update). */
++static void
++riscosRedraw(int *block, Bool update)
++{
++    int more = 0;
++    _kernel_oserror *e;
++
++    e = update ? _swix(Wimp_UpdateWindow, _IN(1) | _OUT(0), block, &more)
++               : _swix(Wimp_RedrawWindow, _IN(1) | _OUT(0), block, &more);
++    while (e == NULL && more) {
++        /* Work area origin on screen: its top left. */
++        int ox = block[1] - block[5];
++        int oy = block[4] - block[6];
++
++        _swix(OS_SpriteOp, _INR(0, 7), 52 + 512, rd.area, rd.sprite,
++              ox, oy - (rd.height << rd.yeig), 0, 0, rd.table);
++        e = _swix(Wimp_GetRectangle, _IN(1) | _OUT(0), block, &more);
++    }
++}
++
++/* The shadow layer's update: tell the Wimp which parts changed. */
++static void
++riscosShadowUpdate(ScreenPtr pScreen, shadowBufPtr pBuf)
++{
++    RegionPtr damage = shadowDamage(pBuf);
++    int n = RegionNumRects(damage);
++    BoxPtr box = RegionRects(damage);
++
++    if (!rd.window || n == 0)
++        return;
++    if (n > MAX_REDRAW_BOXES) {
++        box = RegionExtents(damage);
++        n = 1;
++    }
++    while (n--) {
++        _swix(Wimp_ForceRedraw, _INR(0, 4), rd.window,
++              box->x1 << rd.xeig, -(box->y2 << rd.yeig),
++              box->x2 << rd.xeig, -(box->y1 << rd.yeig));
++        box++;
++    }
++}
++
++static void *
++riscosWindowLinear(ScreenPtr pScreen, CARD32 row, CARD32 offset, int mode,
++                   CARD32 *size, void *closure)
++{
++    *size = rd.stride;
++    return rd.pixels + row * rd.stride;
++}
++
++/* Read the pointer and queue an X event if it moved or a button changed. */
++int
++riscosPollPointer(void)
++{
++    int block[5], x, y, buttons;
++    unsigned long flags = 0;
++
++    if (!riscosPointer || !rd.window)
++        return 0;
++    if (_swix(Wimp_GetPointerInfo, _IN(1), block) != NULL)
++        return 0;
++    /* Over another window: report nothing, unless a button is held down,
++       when X expects to see the drag go on (it is clamped to the screen). */
++    if (block[3] != rd.window && rd.last_buttons == 0)
++        return 0;
++    x = (block[0] - (rd.vis[0] - rd.scroll[0])) >> rd.xeig;
++    y = ((rd.vis[3] - rd.scroll[1]) - block[1]) >> rd.yeig;
++    if (x < 0) x = 0;
++    if (y < 0) y = 0;
++    if (x >= rd.width) x = rd.width - 1;
++    if (y >= rd.height) y = rd.height - 1;
++    /* RISC OS: 4 Select, 2 Menu, 1 Adjust. X: 1, 2, 3. */
++    buttons = block[2] & 7;
++    if (x == rd.last_x && y == rd.last_y && buttons == rd.last_buttons)
++        return 0;
++    if (buttons & 4) flags |= KD_BUTTON_1;
++    if (buttons & 2) flags |= KD_BUTTON_2;
++    if (buttons & 1) flags |= KD_BUTTON_3;
++    rd.last_x = x;
++    rd.last_y = y;
++    rd.last_buttons = buttons;
++    KdEnqueuePointerEvent(riscosPointer, flags, x, y, 0);
++    return 1;
++}
++
++/* Wimp events from rwl. Returns non-zero when X has input to process. */
++static int
++riscosEvent(int reason, int *block, void *data)
++{
++    switch (reason) {
++    case 0:                             /* null: pointer tracking */
++        return riscosPollPointer();
++    case Redraw_Window_Request:
++        if (block[0] == rd.window)
++            riscosRedraw(block, FALSE);
++        return 0;
++    case Open_Window_Request:
++        if (block[0] == rd.window) {
++            _swix(Wimp_OpenWindow, _IN(1), block);
++            riscosReadWindowState();
++        }
++        return 0;
++    case Close_Window_Request:
++        if (block[0] == rd.window) {
++            LogMessage(X_INFO, "RISC OS: window closed; shutting down\n");
++            GiveUp(SIGTERM);
++            return 1;
++        }
++        return 0;
++    case Pointer_Entering_Window:
++        if (block[0] != rd.window)
++            return 0;
++        rd.pointer_inside = 1;
++        rwl_set_null_interval(POINTER_POLL_MS);
++        return riscosPollPointer();
++    case Pointer_Leaving_Window:
++        if (block[0] != rd.window)
++            return 0;
++        rd.pointer_inside = 0;
++        /* Keep polling while a button is held, for drags. */
++        if (rd.last_buttons == 0)
++            rwl_set_null_interval(0);
++        return riscosPollPointer();
++    case Mouse_Click:
++        if (block[3] == rd.window) {
++            /* Take the input focus, with no visible caret. */
++            _swix(Wimp_SetCaretPosition, _INR(0, 5), rd.window, -1, 0, 0,
++                  1 << 25, -1);
++            return riscosPollPointer();
++        }
++        return 0;
++    case Key_Pressed:
++        /* Keyboard input is not handled yet: pass the key on. */
++        _swix(Wimp_ProcessKey, _IN(0), block[6]);
++        return 0;
++    case User_Message:
++    case User_Message_Recorded:
++        if (block[4] == Message_ModeChange) {
++            riscosReadMode();
++            if (rd.window) {
++                riscosReadWindowState();
++                _swix(Wimp_ForceRedraw, _INR(0, 4), rd.window,
++                      0, -(rd.height << rd.yeig), rd.width << rd.xeig, 0);
++            }
++        }
++        return 0;
++    default:
++        return 0;
++    }
++}
++
++/* kdrive card and screen functions */
++
++Bool
++riscosCardInit(KdCardInfo * card)
++{
++    const char *why = "";
++    char name[48];
++
++    snprintf(name, sizeof name, "X server %s", display ? display : "");
++    if (rwl_init(name, &why) != 0) {
++        ErrorF("Xriscos must run as a Wimp task in the desktop: %s\n", why);
++        return FALSE;
++    }
++    rwl_set_handler(riscosEvent, NULL);
++    card->driver = &rd;
++    return TRUE;
++}
++
++Bool
++riscosScreenInit(KdScreenInfo * screen)
++{
++    RiscosScrPriv *scrpriv;
++
++    scrpriv = calloc(1, sizeof(RiscosScrPriv));
++    if (!scrpriv)
++        return FALSE;
++    screen->driver = scrpriv;
++    scrpriv->randr = RR_Rotate_0;
++
++    if (!screen->width || !screen->height) {
++        screen->width = 640;
++        screen->height = 480;
++    }
++    screen->rate = 60;
++    screen->fb.visuals = (1 << TrueColor);
++    /* RISC OS pixel layouts: red in the low bits. */
++    if (screen->fb.depth > 16) {
++        screen->fb.depth = 24;
++        screen->fb.bitsPerPixel = 32;
++        screen->fb.redMask = 0x0000ff;
++        screen->fb.greenMask = 0x00ff00;
++        screen->fb.blueMask = 0xff0000;
++    }
++    else {
++        screen->fb.depth = 15;
++        screen->fb.bitsPerPixel = 16;
++        screen->fb.redMask = 0x001f;
++        screen->fb.greenMask = 0x03e0;
++        screen->fb.blueMask = 0x7c00;
++    }
++
++    riscosReadMode();
++    if (!riscosMakeSprite(screen->width, screen->height,
++                          screen->fb.bitsPerPixel)) {
++        free(scrpriv);
++        screen->driver = NULL;
++        return FALSE;
++    }
++    if (!rd.window && !riscosMakeWindow()) {
++        free(scrpriv);
++        screen->driver = NULL;
++        return FALSE;
++    }
++    screen->fb.shadow = FALSE;          /* the sprite is the framebuffer */
++    screen->fb.frameBuffer = rd.pixels;
++    screen->fb.byteStride = rd.stride;
++    screen->fb.pixelStride = rd.stride * 8 / screen->fb.bitsPerPixel;
++    return TRUE;
++}
++
++static Bool
++riscosCreateColormap(ColormapPtr pmap)
++{
++    return fbInitializeColormap(pmap);
++}
++
++Bool
++riscosInitScreen(ScreenPtr pScreen)
++{
++    pScreen->CreateColormap = riscosCreateColormap;
++    return TRUE;
++}
++
++#ifdef RANDR
++static Bool
++riscosRandRGetInfo(ScreenPtr pScreen, Rotation * rotations)
++{
++    KdScreenPriv(pScreen);
++    KdScreenInfo *screen = pScreenPriv->screen;
++    RRScreenSizePtr pSize;
++
++    *rotations = RR_Rotate_0;
++    pSize = RRRegisterSize(pScreen, screen->width, screen->height,
++                           screen->width_mm, screen->height_mm);
++    RRSetCurrentConfig(pScreen, RR_Rotate_0, 0, pSize);
++    return TRUE;
++}
++
++static Bool
++riscosRandRSetConfig(ScreenPtr pScreen, Rotation randr, int rate,
++                     RRScreenSizePtr pSize)
++{
++    /* One size, no rotation, for now. */
++    return randr == RR_Rotate_0 &&
++        pSize->width == pScreen->width && pSize->height == pScreen->height;
++}
++#endif
++
++Bool
++riscosFinishInitScreen(ScreenPtr pScreen)
++{
++    if (!shadowSetup(pScreen))
++        return FALSE;
++#ifdef RANDR
++    {
++        rrScrPrivPtr pScrPriv;
++
++        if (!RRScreenInit(pScreen))
++            return FALSE;
++        pScrPriv = rrGetScrPriv(pScreen);
++        pScrPriv->rrGetInfo = riscosRandRGetInfo;
++        pScrPriv->rrSetConfig = riscosRandRSetConfig;
++    }
++#endif
++    return TRUE;
++}
++
++Bool
++riscosCreateResources(ScreenPtr pScreen)
++{
++    /* Damage tracking only: the update tells the Wimp what changed. */
++    return shadowAdd(pScreen, pScreen->GetScreenPixmap(pScreen),
++                     riscosShadowUpdate, riscosWindowLinear, 0, NULL);
++}
++
++void
++riscosPreserve(KdCardInfo * card)
++{
++}
++
++Bool
++riscosEnable(ScreenPtr pScreen)
++{
++    /* A new generation starts with a cleared framebuffer: show it. */
++    if (rd.window)
++        _swix(Wimp_ForceRedraw, _INR(0, 4), rd.window,
++              0, -(rd.height << rd.yeig), rd.width << rd.xeig, 0);
++    return TRUE;
++}
++
++Bool
++riscosDPMS(ScreenPtr pScreen, int mode)
++{
++    return TRUE;
++}
++
++void
++riscosDisable(ScreenPtr pScreen)
++{
++}
++
++void
++riscosRestore(KdCardInfo * card)
++{
++}
++
++void
++riscosScreenFini(KdScreenInfo * screen)
++{
++    free(screen->driver);
++    screen->driver = NULL;
++}
++
++void
++riscosCardFini(KdCardInfo * card)
++{
++    /* The window and sprite stay for the next generation. */
++}
++
++void
++riscosGetColors(ScreenPtr pScreen, int n, xColorItem * pdefs)
++{
++    while (n--) {
++        pdefs->red = pdefs->green = pdefs->blue = 0;
++        pdefs++;
++    }
++}
++
++void
++riscosPutColors(ScreenPtr pScreen, int n, xColorItem * pdefs)
++{
++}
+--- a/hw/kdrive/riscos/mouse.c	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/mouse.c	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,47 @@
++/*
++ * Xriscos pointer: the RISC OS mouse over the X window.
++ *
++ * There is no device to read. riscos.c polls the Wimp for the pointer's
++ * position and buttons while it is over the window, and queues events on the
++ * device registered here.
++ */
++#ifdef HAVE_CONFIG_H
++#include <kdrive-config.h>
++#endif
++#include "riscos.h"
++
++KdPointerInfo *riscosPointer;
++
++static Status
++RiscosMouseInit(KdPointerInfo * pi)
++{
++    pi->nButtons = 3;
++    pi->name = strdup("RISC OS mouse");
++    return Success;
++}
++
++static Status
++RiscosMouseEnable(KdPointerInfo * pi)
++{
++    riscosPointer = pi;
++    return Success;
++}
++
++static void
++RiscosMouseDisable(KdPointerInfo * pi)
++{
++    riscosPointer = NULL;
++}
++
++static void
++RiscosMouseFini(KdPointerInfo * pi)
++{
++}
++
++KdPointerDriver RiscosPointerDriver = {
++    "riscos",
++    RiscosMouseInit,
++    RiscosMouseEnable,
++    RiscosMouseDisable,
++    RiscosMouseFini,
++};
+--- a/hw/kdrive/riscos/kbd.c	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/kbd.c	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,59 @@
++/*
++ * Xriscos keyboard. Not wired up yet: keys typed into the window are passed
++ * back to the Wimp. Scan codes are evdev's (Linux key code), to match the
++ * precompiled keymaps, so X keycodes are scan code + 8.
++ */
++#ifdef HAVE_CONFIG_H
++#include <kdrive-config.h>
++#endif
++#include "riscos.h"
++
++KdKeyboardInfo *riscosKeyboard;
++
++static Status
++RiscosKeyboardInit(KdKeyboardInfo * ki)
++{
++    ki->minScanCode = 0;
++    ki->maxScanCode = 247;
++    ki->name = strdup("RISC OS keyboard");
++    return Success;
++}
++
++static Status
++RiscosKeyboardEnable(KdKeyboardInfo * ki)
++{
++    riscosKeyboard = ki;
++    return Success;
++}
++
++static void
++RiscosKeyboardDisable(KdKeyboardInfo * ki)
++{
++    riscosKeyboard = NULL;
++}
++
++static void
++RiscosKeyboardFini(KdKeyboardInfo * ki)
++{
++}
++
++static void
++RiscosKeyboardLeds(KdKeyboardInfo * ki, int leds)
++{
++}
++
++static void
++RiscosKeyboardBell(KdKeyboardInfo * ki, int volume, int frequency, int duration)
++{
++}
++
++KdKeyboardDriver RiscosKeyboardDriver = {
++    "riscos",
++    RiscosKeyboardInit,
++    RiscosKeyboardEnable,
++    RiscosKeyboardLeds,
++    RiscosKeyboardBell,
++    RiscosKeyboardDisable,
++    RiscosKeyboardFini,
++    NULL,
++};
+--- a/hw/kdrive/riscos/os.c	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/os.c	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,41 @@
++/* Xriscos OS glue: nothing to set up beyond what rwl and riscos.c do. */
++#ifdef HAVE_CONFIG_H
++#include <kdrive-config.h>
++#endif
++#include "riscos.h"
++
++static int
++RiscosInit(void)
++{
++    return 1;
++}
++
++static void
++RiscosEnable(void)
++{
++}
++
++static Bool
++RiscosSpecialKey(KeySym sym)
++{
++    return FALSE;
++}
++
++static void
++RiscosDisable(void)
++{
++}
++
++static void
++RiscosFini(void)
++{
++}
++
++KdOsFuncs RiscosOsFuncs = {
++    RiscosInit,
++    RiscosEnable,
++    RiscosSpecialKey,
++    RiscosDisable,
++    RiscosFini,
++    0
++};
+--- a/hw/kdrive/riscos/riscosinit.c	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/riscosinit.c	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,113 @@
++/* Xriscos: kdrive entry points. Based on hw/kdrive/fake/fakeinit.c. */
++#ifdef HAVE_CONFIG_H
++#include <kdrive-config.h>
++#endif
++#include "riscos.h"
++
++Bool riscosCardInit(KdCardInfo * card);
++Bool riscosScreenInit(KdScreenInfo * screen);
++Bool riscosInitScreen(ScreenPtr pScreen);
++Bool riscosFinishInitScreen(ScreenPtr pScreen);
++Bool riscosCreateResources(ScreenPtr pScreen);
++void riscosPreserve(KdCardInfo * card);
++Bool riscosEnable(ScreenPtr pScreen);
++Bool riscosDPMS(ScreenPtr pScreen, int mode);
++void riscosDisable(ScreenPtr pScreen);
++void riscosRestore(KdCardInfo * card);
++void riscosScreenFini(KdScreenInfo * screen);
++void riscosCardFini(KdCardInfo * card);
++void riscosGetColors(ScreenPtr pScreen, int n, xColorItem * pdefs);
++void riscosPutColors(ScreenPtr pScreen, int n, xColorItem * pdefs);
++
++void
++InitCard(char *name)
++{
++    KdCardInfoAdd(&riscosFuncs, 0);
++}
++
++void
++InitOutput(ScreenInfo * pScreenInfo, int argc, char **argv)
++{
++    KdInitOutput(pScreenInfo, argc, argv);
++}
++
++void
++InitInput(int argc, char **argv)
++{
++    KdPointerInfo *pi;
++    KdKeyboardInfo *ki;
++
++    pi = KdNewPointer();
++    if (!pi)
++        return;
++    pi->driver = &RiscosPointerDriver;
++    KdAddPointer(pi);
++
++    ki = KdNewKeyboard();
++    if (!ki)
++        return;
++    ki->driver = &RiscosKeyboardDriver;
++    KdAddKeyboard(ki);
++
++    KdInitInput();
++}
++
++void
++CloseInput(void)
++{
++    KdCloseInput();
++}
++
++#ifdef DDXBEFORERESET
++void
++ddxBeforeReset(void)
++{
++}
++#endif
++
++void
++ddxUseMsg(void)
++{
++    KdUseMsg();
++}
++
++int
++ddxProcessArgument(int argc, char **argv, int i)
++{
++    return KdProcessArgument(argc, argv, i);
++}
++
++void
++OsVendorInit(void)
++{
++    KdOsInit(&RiscosOsFuncs);
++}
++
++KdCardFuncs riscosFuncs = {
++    riscosCardInit,             /* cardinit */
++    riscosScreenInit,           /* scrinit */
++    riscosInitScreen,           /* initScreen */
++    riscosFinishInitScreen,     /* finishInitScreen */
++    riscosCreateResources,      /* createRes */
++    riscosPreserve,             /* preserve */
++    riscosEnable,               /* enable */
++    riscosDPMS,                 /* dpms */
++    riscosDisable,              /* disable */
++    riscosRestore,              /* restore */
++    riscosScreenFini,           /* scrfini */
++    riscosCardFini,             /* cardfini */
++
++    0,                          /* initCursor */
++    0,                          /* enableCursor */
++    0,                          /* disableCursor */
++    0,                          /* finiCursor */
++    0,                          /* recolorCursor */
++
++    0,                          /* initAccel */
++    0,                          /* enableAccel */
++    0,                          /* disableAccel */
++    0,                          /* finiAccel */
++
++    riscosGetColors,            /* getColors */
++    riscosPutColors,            /* putColors */
++};

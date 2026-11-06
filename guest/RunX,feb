@@ -1,0 +1,5 @@
+| Obey file: start Xriscos, the X server in a desktop window, as a Wimp task.
+| StartX runs inside the new task, so its WimpSlot sizes that task.
+RMEnsure SharedUnixLibrary 1.07 RMLoad <Obey$Dir>.SharedULib
+Dir <Obey$Dir>
+WimpTask Obey <Obey$Dir>.StartX

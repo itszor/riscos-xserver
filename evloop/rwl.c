@@ -43,6 +43,9 @@ static volatile int *blk;		/* RMA block, or NULL */
 static int vector_claimed, event_enabled, task_handle, quit_seen, at_exit_set;
 static int poll_block[64];
 static struct rwl_stats st;
+static rwl_handler handler;
+static void *handler_data;
+static int null_interval_ms;
 static void (*trace_fn)(const char *);
 
 void
@@ -89,6 +92,25 @@ rwl_shutdown(void)
 }
 
 int
+rwl_task_handle(void)
+{
+	return task_handle;
+}
+
+void
+rwl_set_handler(rwl_handler fn, void *data)
+{
+	handler = fn;
+	handler_data = data;
+}
+
+void
+rwl_set_null_interval(int ms)
+{
+	null_interval_ms = ms > 0 ? ms : 0;
+}
+
+int
 rwl_init(const char *task_name, const char **why)
 {
 	static const int messages[] = { 0 };	/* Message_Quit is always sent */
@@ -96,6 +118,8 @@ rwl_init(const char *task_name, const char **why)
 	void *mem = NULL;
 	_kernel_oserror *e;
 
+	if (task_handle != 0)
+		return 0;
 	if (!at_exit_set) {
 		atexit(rwl_shutdown);
 		at_exit_set = 1;
@@ -151,9 +175,10 @@ rwl_watch_socket(int fd)
 	return ioctl(fd, FIOASYNC, &on);
 }
 
-/* One Wimp_Poll or Wimp_PollIdle. Returns the reason code. */
+/* One Wimp_Poll or Wimp_PollIdle. Returns the reason code; *woken is set
+   if the event handler reported work. */
 static int
-poll_once(int with_null, long deadline_ms, int use_deadline)
+poll_once(int with_null, long deadline_ms, int use_deadline, int *woken)
 {
 	unsigned mask = POLL_SCAN_POLLWORD | POLL_POLLWORD_HIGH;
 	int reason = -1;
@@ -171,6 +196,9 @@ poll_once(int with_null, long deadline_ms, int use_deadline)
 	switch (reason) {
 	case REASON_NULL:
 		st.null_events++;
+		if (null_interval_ms > 0 && handler != NULL &&
+		    handler(reason, poll_block, handler_data))
+			*woken = 1;
 		break;
 	case REASON_POLLWORD:
 		st.pollword_events++;
@@ -181,9 +209,13 @@ poll_once(int with_null, long deadline_ms, int use_deadline)
 		st.messages++;
 		if (poll_block[4] == Message_Quit)
 			quit_seen = 1;
+		else if (handler != NULL && handler(reason, poll_block, handler_data))
+			*woken = 1;
 		break;
 	default:
 		st.other_events++;
+		if (handler != NULL && handler(reason, poll_block, handler_data))
+			*woken = 1;
 		break;
 	}
 	return reason;
@@ -204,7 +236,9 @@ take_pollword(void)
 enum rwl_result
 rwl_wait(int timeout_ms)
 {
-	long deadline = rwl_now_ms() + (timeout_ms > 0 ? timeout_ms : 0);
+	long now = rwl_now_ms();
+	long deadline = now + (timeout_ms > 0 ? timeout_ms : 0);
+	int woken = 0;
 
 	if (blk == NULL || task_handle == 0)
 		return RWL_ERROR;
@@ -212,18 +246,33 @@ rwl_wait(int timeout_ms)
 	/* Work already waiting, or a pure yield: one Wimp_Poll with null
 	   events allowed, so other tasks get a turn but we are back at once. */
 	if (blk[BLK_POLLWORD] != 0 || timeout_ms == 0) {
-		poll_once(1, 0, 0);
-		if (quit_seen)
-			return RWL_QUIT;
-		return take_pollword() ? RWL_READY : RWL_TIMEOUT;
-	}
-
-	for (;;) {
-		poll_once(0, deadline, timeout_ms > 0);
+		poll_once(1, 0, 0, &woken);
 		if (quit_seen)
 			return RWL_QUIT;
 		if (take_pollword())
 			return RWL_READY;
+		return woken ? RWL_EVENT : RWL_TIMEOUT;
+	}
+
+	for (;;) {
+		/* Wake for the caller's timeout or the next null event the
+		   handler asked for, whichever is sooner. */
+		int use_deadline = timeout_ms > 0 || null_interval_ms > 0;
+		long wake = deadline;
+
+		if (null_interval_ms > 0) {
+			long next_null = rwl_now_ms() + null_interval_ms;
+
+			if (timeout_ms <= 0 || next_null - deadline < 0)
+				wake = next_null;
+		}
+		poll_once(0, wake, use_deadline, &woken);
+		if (quit_seen)
+			return RWL_QUIT;
+		if (take_pollword())
+			return RWL_READY;
+		if (woken)
+			return RWL_EVENT;
 		if (timeout_ms > 0 && rwl_now_ms() - deadline >= 0)
 			return RWL_TIMEOUT;
 	}
