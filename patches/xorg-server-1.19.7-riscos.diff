@@ -295,7 +295,7 @@
  	$(AM_V_at)for i in $(SERVER_SUBDIRS) ; do $(MAKE) -C $$i relink || exit 1 ; done
 --- a/hw/kdrive/riscos/Makefile.am	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/Makefile.am	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,37 @@
 +# Xriscos: the kdrive X server for the RISC OS desktop. The X screen is a
 +# sprite shown in a Wimp window; see riscos.c.
 +AM_CPPFLAGS = 					\
@@ -309,6 +309,9 @@
 +libriscos_la_SOURCES =	\
 +	riscos.c	\
 +	riscos.h	\
++	iconbar.c	\
++	vcache.c	\
++	xlogo.h		\
 +	mouse.c		\
 +	kbd.c		\
 +	cursor.c	\
@@ -332,7 +335,7 @@
 +	$(AM_V_at)rm -f $(bin_PROGRAMS) && $(MAKE) $(bin_PROGRAMS)
 --- a/hw/kdrive/riscos/riscos.h	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscos.h	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,69 @@
 +/*
 + * Xriscos: the kdrive X server for the RISC OS desktop.
 + *
@@ -382,10 +385,29 @@
 +extern Bool riscosKeyLog;
 +int riscosKeysReleaseAll(void);
 +
++/* Full screen (riscos.c): X draws straight into screen memory. */
++int riscosIsFullscreen(void);
++/* Switch it on or off; returns non-zero if X has work to do. */
++int riscosToggleFullscreen(void);
++/* Bring the X window to the front, opening it if it was closed. */
++void riscosShowWindow(void);
++
++/* The icon bar icon and its menu (iconbar.c). The event functions return
++   non-zero if X has work to do. */
++void riscosIconbarInit(void);
++int riscosIconbarClick(int *block);
++int riscosMenuSelection(int *block);
++
++/* Caching screen memory while X draws into it (vcache.c). */
++extern Bool riscosVCacheEnabled;        /* -novcache clears it */
++void riscosVCacheStart(void *start, int bytes);
++void riscosVCacheStop(void);
++void riscosVCacheIdle(int idle);
++
 +#endif
 --- a/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,774 @@
+@@ -0,0 +1,1212 @@
 +/*
 + * Xriscos: the kdrive X server for the RISC OS desktop.
 + *
@@ -405,6 +427,13 @@
 + * window. The work area is as big as the desktop, so the window can grow to
 + * that; it has no scroll bars, since the X screen always fills it.
 + *
++ * Full screen (the icon bar menu, or Alt+Return) does without the sprite: a
++ * window with no furniture covers the desktop, and X draws straight into
++ * screen memory, at the desktop's size and depth. Nothing is plotted; when
++ * the Wimp asks for part of that window to be redrawn (after an error box,
++ * say), X is asked to repaint it, as for exposed windows. While X runs the
++ * screen is made cacheable (vcache.c).
++ *
 + * Based on hw/kdrive/fake (Keith Packard).
 + */
 +#ifdef HAVE_CONFIG_H
@@ -418,6 +447,8 @@
 +#include "riscos.h"
 +#include "shadow.h"
 +#include "opaque.h"             /* display */
++#include "windowstr.h"
++#include "inputstr.h"
 +
 +/* Wimp event reason codes and messages */
 +#define Redraw_Window_Request   1
@@ -426,6 +457,7 @@
 +#define Pointer_Leaving_Window  4
 +#define Pointer_Entering_Window 5
 +#define Mouse_Click             6
++#define Menu_Selection          9
 +#define Key_Pressed             8
 +#define Lose_Caret              11
 +#define Gain_Caret              12
@@ -446,13 +478,20 @@
 +/* OS_ReadModeVariable numbers */
 +#define VAR_XEIG        4
 +#define VAR_YEIG        5
++#define VAR_LINELENGTH  6
 +#define VAR_LOG2BPP     9
 +#define VAR_XWINDLIMIT  11
 +#define VAR_YWINDLIMIT  12
 +
-+/* The desktop side: one window showing one sprite, for the whole run. */
++/* VDU variable: the screen memory the VDU drivers draw into */
++#define VDU_SCREENSTART 148
++
++/* The desktop side: one window showing one sprite, for the whole run; and
++   for full screen, a second window covering the desktop. */
 +static struct {
-+    int window;                 /* Wimp window handle, 0 until made */
++    int window;                 /* the window showing X: normal or full */
++    int normal;                 /* the ordinary window, 0 until made */
++    int full;                   /* the full screen window, 0 until made */
 +    int width, height, bpp;     /* the sprite, in pixels */
 +    int *area;                  /* sprite area holding the one sprite */
 +    int *sprite;                /* the sprite header */
@@ -471,6 +510,14 @@
 +    int pending_w, pending_h;   /* size the window has, X has not, or 0 */
 +    long pending_since;         /* when the window last changed size */
 +    int resize_queued;          /* a work procedure is due to resize */
++    int scr_w, scr_h;           /* the X screen, in pixels */
++    /* full screen */
++    int fullscreen;             /* wanted: the full window is showing */
++    int on_screen;              /* the framebuffer is screen memory */
++    int switch_queued;          /* a work procedure is due to catch up */
++    int normal_state[9];        /* the normal window, before full screen */
++    RegionRec expose;           /* to repaint, once X can (full screen) */
++    int expose_queued;
 +} rd;
 +
 +static int riscosEvent(int reason, int *block, void *data);
@@ -651,11 +698,47 @@
 +                   e->errmess);
 +        return FALSE;
 +    }
++    rd.normal = rd.window;
 +    state[0] = rd.window;
 +    _swix(Wimp_GetWindowState, _IN(1), state);
 +    state[7] = -1;
 +    _swix(Wimp_OpenWindow, _IN(1), state);
 +    riscosReadWindowState();
++    return TRUE;
++}
++
++/* Make the full screen window, once: no furniture, covering the desktop,
++   with a transparent background since X draws everything. */
++static Bool
++riscosMakeFullWindow(void)
++{
++    int block[23];
++    _kernel_oserror *e;
++
++    if (rd.full)
++        return TRUE;
++    memset(block, 0, sizeof block);
++    block[6] = -1;
++    block[7] = (int) 0x80000000u;       /* new-style flags, no furniture */
++    ((char *) block)[32] = (char) 0xff; /* no title */
++    ((char *) block)[33] = 2;
++    ((char *) block)[34] = 7;
++    ((char *) block)[35] = (char) 0xff; /* work area background: none */
++    ((char *) block)[36] = 3;
++    ((char *) block)[37] = 1;
++    ((char *) block)[38] = 12;
++    block[11] = -0x4000;                /* work area: bigger than any mode */
++    block[12] = 0x4000;
++    block[14] = 0;                      /* no title */
++    block[15] = 10 << 12;               /* work area: click/drag buttons */
++    block[16] = 1;
++    block[21] = 0;
++    if ((e = _swix(Wimp_CreateWindow, _IN(1) | _OUT(0), block, &rd.full))) {
++        LogMessage(X_ERROR, "RISC OS: cannot create the full screen "
++                   "window: %s\n", e->errmess);
++        rd.full = 0;
++        return FALSE;
++    }
 +    return TRUE;
 +}
 +
@@ -704,14 +787,14 @@
 +    int n = RegionNumRects(damage);
 +    BoxPtr box = RegionRects(damage);
 +
-+    if (!rd.window || n == 0)
-+        return;
++    if (!rd.normal || n == 0 || rd.on_screen)
++        return;         /* full screen: X drew straight onto the screen */
 +    if (n > MAX_REDRAW_BOXES) {
 +        box = RegionExtents(damage);
 +        n = 1;
 +    }
 +    while (n--) {
-+        _swix(Wimp_ForceRedraw, _INR(0, 4), rd.window,
++        _swix(Wimp_ForceRedraw, _INR(0, 4), rd.normal,
 +              box->x1 << rd.xeig, -(box->y2 << rd.yeig),
 +              box->x2 << rd.xeig, -(box->y1 << rd.yeig));
 +        box++;
@@ -732,60 +815,387 @@
 +{
 +    snprintf(rd.title, sizeof rd.title, "X server %s (%dx%d)",
 +             display ? display : "", rd.width, rd.height);
-+    if (rd.window)
++    if (rd.normal && rd.window == rd.normal)
 +        _swix(Wimp_ForceRedraw, _INR(0, 4), -1, rd.vis[0], rd.vis[3],
 +              rd.vis[2], rd.vis[3] + (24 << rd.yeig));
 +}
 +
-+/* Make the X screen width x height: a new sprite, the screen pixmap moved
-+   onto it, the root window resized (KdEnableScreen) and clients told. */
++/* The desktop's screen memory, as X would draw into it. FALSE if X's depth
++   is not the desktop's. */
 +static Bool
-+riscosResizeScreen(ScreenPtr pScreen, int width, int height)
++riscosScreenMemory(int bpp, int *w, int *h, int *stride, CARD8 **pixels)
++{
++    int vars[2] = { VDU_SCREENSTART, -1 };
++    int log2bpp = readModeVar(VAR_LOG2BPP);
++
++    if ((bpp == 16 && log2bpp != 4) || (bpp == 32 && log2bpp != 5))
++        return FALSE;
++    if (_swix(OS_ReadVduVariables, _INR(0, 1), vars, vars) != NULL)
++        return FALSE;
++    *pixels = (CARD8 *) vars[0];
++    *stride = readModeVar(VAR_LINELENGTH);
++    *w = readModeVar(VAR_XWINDLIMIT) + 1;
++    *h = readModeVar(VAR_YWINDLIMIT) + 1;
++    return TRUE;
++}
++
++/* Show the cursor X thinks is showing. Disabling the screen takes it away
++   (SetRootClip), and X puts it back only when the pointer next moves into
++   another window; the null first makes mi's pointer code send it again. */
++static void
++riscosRedisplayCursor(ScreenPtr pScreen)
++{
++    DeviceIntPtr dev;
++
++    for (dev = inputInfo.devices; dev; dev = dev->next) {
++        CursorPtr cursor;
++
++        if (!DevHasCursor(dev) || !dev->spriteInfo->sprite)
++            continue;
++        cursor = dev->spriteInfo->sprite->current;
++        if (!cursor)
++            continue;
++        (*pScreen->DisplayCursor) (dev, pScreen, NullCursor);
++        (*pScreen->DisplayCursor) (dev, pScreen, cursor);
++    }
++}
++
++/* Make X's framebuffer width x height pixels at the given address: the
++   screen pixmap moved onto it, the root window resized and repainted
++   (KdEnableScreen), and clients told (RandR). */
++static void
++riscosSetFramebuffer(ScreenPtr pScreen, int width, int height, int stride,
++                     CARD8 *pixels)
 +{
 +    KdScreenPriv(pScreen);
 +    KdScreenInfo *screen = pScreenPriv->screen;
 +    PixmapPtr pixmap = pScreen->GetScreenPixmap(pScreen);
 +    Bool wasEnabled = pScreenPriv->enabled;
-+    int old_w = screen->width, old_h = screen->height;
++    /* the first size and physical size, to scale from without drift */
++    static int base_w, base_h, base_mmw, base_mmh;
 +
-+    if (width == old_w && height == old_h)
-+        return TRUE;
++    if (!base_w) {
++        base_w = screen->width;
++        base_h = screen->height;
++        base_mmw = pScreen->mmWidth;
++        base_mmh = pScreen->mmHeight;
++    }
 +    if (wasEnabled)
 +        KdDisableScreen(pScreen);
 +    shadowRemove(pScreen, pixmap);
-+    if (!riscosMakeSprite(width, height, screen->fb.bitsPerPixel)) {
-+        LogMessage(X_ERROR, "RISC OS: no memory for a %dx%d screen\n",
-+                   width, height);
-+        shadowAdd(pScreen, pixmap, riscosShadowUpdate, riscosWindowLinear,
-+                  0, NULL);
-+        if (wasEnabled)
-+            KdEnableScreen(pScreen);
-+        return FALSE;
-+    }
 +    screen->width = width;
 +    screen->height = height;
-+    screen->fb.frameBuffer = rd.pixels;
-+    screen->fb.byteStride = rd.stride;
-+    screen->fb.pixelStride = rd.stride * 8 / screen->fb.bitsPerPixel;
++    screen->fb.frameBuffer = pixels;
++    screen->fb.byteStride = stride;
++    screen->fb.pixelStride = stride * 8 / screen->fb.bitsPerPixel;
 +    /* same resolution: the physical size scales with the pixels */
-+    pScreen->mmWidth = pScreen->mmWidth * width / old_w;
-+    pScreen->mmHeight = pScreen->mmHeight * height / old_h;
++    pScreen->mmWidth = (base_mmw * width + base_w / 2) / base_w;
++    pScreen->mmHeight = (base_mmh * height + base_h / 2) / base_h;
 +    screen->width_mm = pScreen->mmWidth;
 +    screen->height_mm = pScreen->mmHeight;
 +    pScreen->width = width;
 +    pScreen->height = height;
++    rd.scr_w = width;
++    rd.scr_h = height;
 +    (*pScreen->ModifyPixmapHeader) (pixmap, width, height, screen->fb.depth,
-+                                    screen->fb.bitsPerPixel, rd.stride,
-+                                    rd.pixels);
++                                    screen->fb.bitsPerPixel, stride, pixels);
 +    shadowAdd(pScreen, pixmap, riscosShadowUpdate, riscosWindowLinear, 0, NULL);
 +    if (wasEnabled)
 +        KdEnableScreen(pScreen);
 +#ifdef RANDR
 +    RRScreenSizeNotify(pScreen);
++    /* and the output and CRTC, for clients that follow those */
++    RRGetInfo(pScreen, TRUE);
 +#endif
++    riscosRedisplayCursor(pScreen);
++}
++
++/* Make the X screen width x height in the window: a new sprite. */
++static Bool
++riscosResizeScreen(ScreenPtr pScreen, int width, int height)
++{
++    KdScreenPriv(pScreen);
++    KdScreenInfo *screen = pScreenPriv->screen;
++
++    if (rd.on_screen || (width == screen->width && height == screen->height))
++        return TRUE;
++    if (!riscosMakeSprite(width, height, screen->fb.bitsPerPixel)) {
++        LogMessage(X_ERROR, "RISC OS: no memory for a %dx%d screen\n",
++                   width, height);
++        return FALSE;
++    }
++    riscosSetFramebuffer(pScreen, width, height, rd.stride, rd.pixels);
 +    riscosSetTitle();
 +    LogMessage(X_INFO, "RISC OS: screen resized to %dx%d\n", width, height);
 +    return TRUE;
++}
++
++/*
++ * Full screen.
++ *
++ * riscosToggleFullscreen() changes the windows at once: going full screen
++ * opens the full window over everything, and the framebuffer moves to
++ * screen memory when that window is first redrawn (the Wimp has finished
++ * with the screen by then). Coming back, the framebuffer moves back to the
++ * sprite first, from a work procedure, and then the windows change.
++ */
++
++int
++riscosIsFullscreen(void)
++{
++    return rd.fullscreen;
++}
++
++static void
++riscosReportError(const char *message)
++{
++    _kernel_oserror err;
++
++    err.errnum = 0;
++    snprintf(err.errmess, sizeof err.errmess, "%s", message);
++    /* OK box, titled with the task's name */
++    _swix(Wimp_ReportError, _INR(0, 2), &err, 1, "X server");
++}
++
++/* The pointer is no longer known to be over the window showing X. */
++static void
++riscosForgetPointer(void)
++{
++    rd.pointer_inside = 0;
++    riscosCursorLeave();
++    riscosSetNullInterval();
++}
++
++/* Give the window showing X the input focus. */
++static void
++riscosTakeFocus(void)
++{
++    _swix(Wimp_SetCaretPosition, _INR(0, 5), rd.window, -1, 0, 0,
++          1 << 25, -1);
++}
++
++/* Move X onto the screen memory, or back into the sprite. */
++static void
++riscosSwitchFramebuffer(int on_screen)
++{
++    ScreenPtr pScreen = rd.screen;
++    int w, h, stride;
++    CARD8 *pixels;
++
++    if (!pScreen || on_screen == rd.on_screen)
++        return;
++    if (on_screen) {
++        if (!riscosScreenMemory(rd.bpp, &w, &h, &stride, &pixels))
++            return;
++        rd.on_screen = 1;
++        riscosVCacheStart(pixels, stride * h);
++        riscosSetFramebuffer(pScreen, w, h, stride, pixels);
++        LogMessage(X_INFO, "RISC OS: full screen, %dx%d\n", w, h);
++    }
++    else {
++        /* the sprite is still the size of the window */
++        rd.on_screen = 0;
++        riscosVCacheStop();
++        riscosSetFramebuffer(pScreen, rd.width, rd.height, rd.stride,
++                             rd.pixels);
++        LogMessage(X_INFO, "RISC OS: back in the window, %dx%d\n",
++                   rd.width, rd.height);
++    }
++}
++
++/* Put the windows back as they were before full screen. */
++static void
++riscosLeaveFullWindow(void)
++{
++    int *state = rd.normal_state;
++
++    _swix(Wimp_CloseWindow, _IN(1), &rd.full);
++    riscosForgetPointer();
++    rd.window = rd.normal;
++    state[0] = rd.normal;
++    state[7] = -1;                      /* on top */
++    _swix(Wimp_OpenWindow, _IN(1), state);
++    riscosReadWindowState();
++    riscosTakeFocus();
++    riscosSetTitle();
++}
++
++/* Run from the work queue: bring the framebuffer and windows into line
++   with rd.fullscreen. */
++static Bool
++riscosSwitchWork(ClientPtr client, void *closure)
++{
++    rd.switch_queued = 0;
++    if (rd.fullscreen) {
++        riscosSwitchFramebuffer(1);
++        if (!rd.on_screen) {            /* the desktop changed under us */
++            rd.fullscreen = 0;
++            riscosLeaveFullWindow();
++        }
++    }
++    else {
++        riscosSwitchFramebuffer(0);
++        if (rd.window == rd.full)
++            riscosLeaveFullWindow();
++    }
++    return TRUE;
++}
++
++static void
++riscosQueueSwitch(void)
++{
++    if (rd.switch_queued)
++        return;
++    rd.switch_queued = 1;
++    QueueWorkProc(riscosSwitchWork, NULL, NULL);
++}
++
++int
++riscosToggleFullscreen(void)
++{
++    int w, h, stride, block[9];
++    CARD8 *pixels;
++
++    if (!rd.screen || !rd.normal)
++        return 0;
++    if (rd.fullscreen) {
++        rd.fullscreen = 0;
++        riscosQueueSwitch();
++        return 1;
++    }
++    if (!riscosScreenMemory(rd.bpp, &w, &h, &stride, &pixels)) {
++        riscosReportError(rd.bpp == 16 ?
++            "Full screen needs a desktop with 32 thousand colours, the "
++            "depth X is running at." :
++            "Full screen needs a desktop with 16 million colours, the "
++            "depth X is running at.");
++        return 0;
++    }
++    if (!riscosMakeFullWindow())
++        return 0;
++    /* Remember the normal window, then swap it for the full one. */
++    rd.normal_state[0] = rd.normal;
++    _swix(Wimp_GetWindowState, _IN(1), rd.normal_state);
++    _swix(Wimp_CloseWindow, _IN(1), &rd.normal);
++    riscosForgetPointer();
++    rd.pending_w = rd.pending_h = 0;
++    block[0] = rd.full;
++    block[1] = 0;
++    block[2] = 0;
++    block[3] = w << rd.xeig;
++    block[4] = h << rd.yeig;
++    block[5] = 0;
++    block[6] = 0;
++    block[7] = -1;
++    _swix(Wimp_OpenWindow, _IN(1), block);
++    rd.window = rd.full;
++    rd.fullscreen = 1;
++    riscosReadWindowState();
++    riscosTakeFocus();
++    /* the framebuffer follows when the window is first redrawn */
++    return 0;
++}
++
++/* Select on the icon bar icon. */
++void
++riscosShowWindow(void)
++{
++    int state[9];
++
++    if (rd.fullscreen || !rd.normal)
++        return;
++    state[0] = rd.normal;
++    if (_swix(Wimp_GetWindowState, _IN(1), state) != NULL)
++        return;
++    state[7] = -1;
++    _swix(Wimp_OpenWindow, _IN(1), state);
++    riscosReadWindowState();
++    riscosTakeFocus();
++}
++
++/* Repaint what the Wimp lost of the full screen window: each viewable
++   window's share of it, background and border, with Expose events for its
++   client, as when windows are uncovered. */
++static int
++riscosExposeVisit(WindowPtr pWin, void *data)
++{
++    RegionPtr exposed = data;
++    ScreenPtr pScreen = pWin->drawable.pScreen;
++    RegionRec r;
++
++    if (!pWin->viewable)
++        return WT_DONTWALKCHILDREN;
++    RegionNull(&r);
++    if (wBorderWidth(pWin)) {
++        RegionSubtract(&r, &pWin->borderClip, &pWin->winSize);
++        RegionIntersect(&r, &r, exposed);
++        if (RegionNotEmpty(&r))
++            (*pScreen->PaintWindow) (pWin, &r, PW_BORDER);
++    }
++    RegionIntersect(&r, exposed, &pWin->clipList);
++    if (RegionNotEmpty(&r))
++        (*pScreen->WindowExposures) (pWin, &r);
++    RegionUninit(&r);
++    return WT_WALKCHILDREN;
++}
++
++static Bool
++riscosExposeWork(ClientPtr client, void *closure)
++{
++    rd.expose_queued = 0;
++    if (rd.screen && rd.on_screen && RegionNotEmpty(&rd.expose)) {
++        KdScreenPriv(rd.screen);
++
++        if (pScreenPriv->enabled)
++            TraverseTree(rd.screen->root, riscosExposeVisit, &rd.expose);
++    }
++    RegionEmpty(&rd.expose);
++    return TRUE;
++}
++
++/* A redraw request for the full screen window. Nothing is plotted: X
++   repaints, from a work procedure, what the Wimp says was lost. */
++static int
++riscosRedrawFull(int *block)
++{
++    int more = 0, woken = 0;
++    int ox = rd.vis[0] - rd.scroll[0], oy = rd.vis[3] - rd.scroll[1];
++
++    if (_swix(Wimp_RedrawWindow, _IN(1) | _OUT(0), block, &more) != NULL)
++        return 0;
++    while (more) {
++        if (rd.on_screen) {
++            /* the rectangle, block[7-10], inclusive OS units, as X pixels */
++            BoxRec box;
++            RegionRec r;
++
++            box.x1 = (block[7] - ox) >> rd.xeig;
++            box.x2 = ((block[9] - ox) >> rd.xeig) + 1;
++            box.y1 = (oy - block[10] - 1) >> rd.yeig;
++            box.y2 = ((oy - block[8]) >> rd.yeig) + 1;
++            if (box.x1 < 0) box.x1 = 0;
++            if (box.y1 < 0) box.y1 = 0;
++            if (box.x2 > rd.scr_w) box.x2 = rd.scr_w;
++            if (box.y2 > rd.scr_h) box.y2 = rd.scr_h;
++            if (box.x1 < box.x2 && box.y1 < box.y2) {
++                RegionInit(&r, &box, 1);
++                RegionUnion(&rd.expose, &rd.expose, &r);
++                RegionUninit(&r);
++            }
++        }
++        if (_swix(Wimp_GetRectangle, _IN(1) | _OUT(0), block, &more) != NULL)
++            break;
++    }
++    if (rd.fullscreen && !rd.on_screen) {
++        riscosQueueSwitch();
++        woken = 1;
++    }
++    else if (RegionNotEmpty(&rd.expose) && !rd.expose_queued) {
++        rd.expose_queued = 1;
++        QueueWorkProc(riscosExposeWork, NULL, NULL);
++        woken = 1;
++    }
++    return woken;
 +}
 +
 +/* Run from the server's work queue, outside any request. */
@@ -826,7 +1236,7 @@
 +static int
 +riscosCheckResize(void)
 +{
-+    if (!rd.pending_w || rd.resize_queued || !rd.screen)
++    if (!rd.pending_w || rd.resize_queued || !rd.screen || rd.fullscreen)
 +        return 0;
 +    if (nowMs() - rd.pending_since < RESIZE_SETTLE_MS)
 +        return 0;
@@ -857,8 +1267,8 @@
 +    y = ((rd.vis[3] - rd.scroll[1]) - block[1]) >> rd.yeig;
 +    if (x < 0) x = 0;
 +    if (y < 0) y = 0;
-+    if (x >= rd.width) x = rd.width - 1;
-+    if (y >= rd.height) y = rd.height - 1;
++    if (x >= rd.scr_w) x = rd.scr_w - 1;
++    if (y >= rd.scr_h) y = rd.scr_h - 1;
 +    /* RISC OS: 4 Select, 2 Menu, 1 Adjust. X: 1, 2, 3. */
 +    buttons = block[2] & 7;
 +    if (x == rd.last_x && y == rd.last_y && buttons == rd.last_buttons)
@@ -890,11 +1300,25 @@
 +        return woken;
 +    }
 +    case Redraw_Window_Request:
-+        if (block[0] == rd.window)
++        /* An error box, say, puts the Wimp's pointer back without the
++           pointer leaving the window: X's comes back with the redraw. */
++        if (block[0] == rd.window && rd.pointer_inside)
++            riscosCursorEnter(rd.xeig, rd.yeig);
++        if (block[0] == rd.normal)
 +            riscosRedraw(block, FALSE);
++        else if (block[0] == rd.full)
++            return riscosRedrawFull(block);
 +        return 0;
 +    case Open_Window_Request:
-+        if (block[0] == rd.window) {
++        /* Only the window showing X: after a mode change the Wimp asks
++           again for windows that may have been closed since. */
++        if (block[0] != rd.window)
++            return 0;
++        if (block[0] == rd.full) {
++            _swix(Wimp_OpenWindow, _IN(1), block);
++            riscosReadWindowState();
++        }
++        else {
 +            /* RISC OS 3.7 draws a vertical scroll bar alongside the size
 +               icon; keep it inert, since the X screen fills the window. */
 +            block[5] = 0;
@@ -905,10 +1329,11 @@
 +        }
 +        return 0;
 +    case Close_Window_Request:
-+        if (block[0] == rd.window) {
-+            LogMessage(X_INFO, "RISC OS: window closed; shutting down\n");
-+            GiveUp(SIGTERM);
-+            return 1;
++        /* X carries on; Select on the icon bar icon opens it again. */
++        if (block[0] == rd.normal) {
++            _swix(Wimp_CloseWindow, _IN(1), block);
++            if (rd.window == rd.normal)
++                riscosForgetPointer();
 +        }
 +        return 0;
 +    case Pointer_Entering_Window:
@@ -928,24 +1353,25 @@
 +    case Mouse_Click:
 +        if (block[3] == rd.window) {
 +            /* Take the input focus, with no visible caret. */
-+            _swix(Wimp_SetCaretPosition, _INR(0, 5), rd.window, -1, 0, 0,
-+                  1 << 25, -1);
++            riscosTakeFocus();
 +            return riscosPollPointer();
 +        }
-+        return 0;
++        return riscosIconbarClick(block);
++    case Menu_Selection:
++        return riscosMenuSelection(block);
 +    case Key_Pressed:
 +        /* With the focus, keys reach X through KeyV (rwl), as presses and
 +           releases of physical keys; the Wimp's translated copy is not
 +           wanted. Anything else is passed on. */
-+        if (block[0] != rd.window)
++        if (block[0] != rd.normal && block[0] != rd.full)
 +            _swix(Wimp_ProcessKey, _IN(0), block[6]);
 +        return 0;
 +    case Gain_Caret:
-+        if (block[0] == rd.window)
++        if (block[0] == rd.normal || block[0] == rd.full)
 +            rwl_key_capture(1);
 +        return 0;
 +    case Lose_Caret:
-+        if (block[0] != rd.window)
++        if (block[0] != rd.normal && block[0] != rd.full)
 +            return 0;
 +        rwl_key_capture(0);
 +        return riscosKeysReleaseAll();
@@ -955,9 +1381,16 @@
 +    case User_Message_Recorded:
 +        if (block[4] == Message_ModeChange) {
 +            riscosReadMode();
-+            if (rd.window) {
++            if (rd.fullscreen) {
++                /* The screen memory X draws into may have moved: back to
++                   the window now, before X draws again. */
++                rd.fullscreen = 0;
++                riscosSwitchFramebuffer(0);
++                riscosLeaveFullWindow();
++            }
++            if (rd.normal) {
 +                riscosReadWindowState();
-+                _swix(Wimp_ForceRedraw, _INR(0, 4), rd.window,
++                _swix(Wimp_ForceRedraw, _INR(0, 4), rd.normal,
 +                      0, -(rd.height << rd.yeig), rd.width << rd.xeig, 0);
 +            }
 +        }
@@ -981,6 +1414,8 @@
 +        return FALSE;
 +    }
 +    rwl_set_handler(riscosEvent, NULL);
++    rwl_set_idle_hook(riscosVCacheIdle);
++    riscosIconbarInit();
 +    card->driver = &rd;
 +    return TRUE;
 +}
@@ -1019,21 +1454,46 @@
 +    }
 +
 +    riscosReadMode();
++    screen->fb.shadow = FALSE;          /* fb draws straight in */
++    if (rd.on_screen) {
++        /* A server reset while full screen: carry on drawing on it. */
++        int w, h, stride;
++        CARD8 *pixels;
++
++        if (riscosScreenMemory(screen->fb.bitsPerPixel, &w, &h, &stride,
++                               &pixels)) {
++            screen->width = w;
++            screen->height = h;
++            screen->fb.frameBuffer = pixels;
++            screen->fb.byteStride = stride;
++            screen->fb.pixelStride = stride * 8 / screen->fb.bitsPerPixel;
++            rd.scr_w = w;
++            rd.scr_h = h;
++            return TRUE;
++        }
++        rd.on_screen = 0;
++        rd.fullscreen = 0;
++        riscosVCacheStop();
++        riscosLeaveFullWindow();
++        screen->width = rd.width;
++        screen->height = rd.height;
++    }
 +    if (!riscosMakeSprite(screen->width, screen->height,
 +                          screen->fb.bitsPerPixel)) {
 +        free(scrpriv);
 +        screen->driver = NULL;
 +        return FALSE;
 +    }
-+    if (!rd.window && !riscosMakeWindow()) {
++    if (!rd.normal && !riscosMakeWindow()) {
 +        free(scrpriv);
 +        screen->driver = NULL;
 +        return FALSE;
 +    }
-+    screen->fb.shadow = FALSE;          /* the sprite is the framebuffer */
 +    screen->fb.frameBuffer = rd.pixels;
 +    screen->fb.byteStride = rd.stride;
 +    screen->fb.pixelStride = rd.stride * 8 / screen->fb.bitsPerPixel;
++    rd.scr_w = screen->width;
++    rd.scr_h = screen->height;
 +    return TRUE;
 +}
 +
@@ -1112,8 +1572,8 @@
 +riscosEnable(ScreenPtr pScreen)
 +{
 +    /* A new generation starts with a cleared framebuffer: show it. */
-+    if (rd.window)
-+        _swix(Wimp_ForceRedraw, _INR(0, 4), rd.window,
++    if (rd.normal && !rd.on_screen)
++        _swix(Wimp_ForceRedraw, _INR(0, 4), rd.normal,
 +              0, -(rd.height << rd.yeig), rd.width << rd.xeig, 0);
 +    return TRUE;
 +}
@@ -1212,7 +1672,7 @@
 +};
 --- a/hw/kdrive/riscos/kbd.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/kbd.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,154 @@
 +/*
 + * Xriscos keyboard.
 + *
@@ -1221,6 +1681,8 @@
 + * are queued only while the X window has the input focus. Each is mapped to
 + * its evdev (Linux) key code, which is what the precompiled keymaps use, so
 + * the X keycode is that plus 8 (minScanCode 0, KD_MIN_KEYCODE 8).
++ *
++ * Alt+Return is kept from X: it switches full screen on and off.
 + */
 +#ifdef HAVE_CONFIG_H
 +#include <kdrive-config.h>
@@ -1259,6 +1721,12 @@
 +   the window loses the focus while they are held. */
 +static unsigned char key_down[256];
 +
++#define EVDEV_RETURN    28
++#define EVDEV_LEFTALT   56
++#define EVDEV_RIGHTALT  100
++/* The Return of an Alt+Return is held: its release is not X's either. */
++static int return_swallowed;
++
 +/* Take the keys rwl has queued and pass them to X. Returns non-zero if any
 +   were queued for X. */
 +int
@@ -1274,6 +1742,18 @@
 +                   key, pressed ? "down" : "up", code);
 +        if (code == 0 || !riscosKeyboard)
 +            continue;
++        if (code == EVDEV_RETURN) {
++            if (pressed && !key_down[code] &&
++                (key_down[EVDEV_LEFTALT] || key_down[EVDEV_RIGHTALT])) {
++                return_swallowed = 1;
++                queued |= riscosToggleFullscreen();
++                continue;
++            }
++            if (!pressed && return_swallowed) {
++                return_swallowed = 0;
++                continue;
++            }
++        }
 +        if (!pressed && !key_down[code])
 +            continue;           /* pressed before we had the focus */
 +        key_down[code] = pressed;
@@ -1685,7 +2165,7 @@
 +}
 --- a/hw/kdrive/riscos/riscosinit.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscosinit.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,155 @@
 +/* Xriscos: kdrive entry points. Based on hw/kdrive/fake/fakeinit.c. */
 +#ifdef HAVE_CONFIG_H
 +#include <kdrive-config.h>
@@ -1790,6 +2270,7 @@
 +    KdUseMsg();
 +    ErrorF("\nXriscos options:\n");
 +    ErrorF("-keylog                report each RISC OS key event and its mapping\n");
++    ErrorF("-novcache              full screen: leave screen memory uncached\n");
 +}
 +
 +int
@@ -1797,6 +2278,10 @@
 +{
 +    if (!strcmp(argv[i], "-keylog")) {
 +        riscosKeyLog = TRUE;
++        return 1;
++    }
++    if (!strcmp(argv[i], "-novcache")) {
++        riscosVCacheEnabled = FALSE;
 +        return 1;
 +    }
 +    return KdProcessArgument(argc, argv, i);
@@ -1836,3 +2321,352 @@
 +    riscosGetColors,            /* getColors */
 +    riscosPutColors,            /* putColors */
 +};
+--- a/hw/kdrive/riscos/iconbar.c	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/iconbar.c	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,137 @@
++/*
++ * Xriscos: the icon bar icon and its menu.
++ *
++ * The icon is the X logo (xlogo.h, made by tools/mklogo.py), plotted from
++ * the server's own sprite area, so nothing needs loading into the Wimp's
++ * sprite pool. Select brings the X window to the front (opening it again if
++ * it was closed); Menu gives the usual icon bar menu: Fullscreen (ticked
++ * while it is) and Quit. Adjust on a menu item leaves the menu open.
++ */
++#ifdef HAVE_CONFIG_H
++#include <kdrive-config.h>
++#endif
++#include <signal.h>
++#include <string.h>
++#include <kernel.h>
++#include <swis.h>
++#include "riscos.h"
++#include "xlogo.h"
++
++#define ICONBAR_RIGHT   (-1)    /* Wimp_CreateIcon: right-hand side */
++#define ICONBAR_WINDOW  (-2)    /* how clicks on the icon bar arrive */
++#define MENU_ITEM_H     44
++#define BUTTON_SELECT   4
++#define BUTTON_MENU     2
++#define BUTTON_ADJUST   1
++
++enum { ITEM_FULLSCREEN, ITEM_QUIT, N_ITEMS };
++
++typedef struct {
++    int flags, submenu, icon_flags;
++    char text[12];
++} MenuItem;
++
++static struct {
++    char title[12];
++    char title_fg, title_bg, work_fg, work_bg;
++    int width, height, gap;
++    MenuItem item[N_ITEMS];
++} menu;
++
++static int icon = -1;
++static int menu_x;
++static char logo_name[] = RISCOS_LOGO_NAME;
++
++static void
++setItem(int i, const char *text, int flags)
++{
++    menu.item[i].flags = flags;
++    menu.item[i].submenu = -1;
++    menu.item[i].icon_flags = 0x07000021;   /* text, filled, black on white */
++    strncpy(menu.item[i].text, text, sizeof menu.item[i].text);
++}
++
++static void
++openMenu(void)
++{
++    setItem(ITEM_FULLSCREEN, "Fullscreen", riscosIsFullscreen() ? 1 : 0);
++    setItem(ITEM_QUIT, "Quit", 0x80);       /* last item */
++    _swix(Wimp_CreateMenu, _INR(1, 3), &menu, menu_x,
++          96 + MENU_ITEM_H * N_ITEMS);
++}
++
++void
++riscosIconbarInit(void)
++{
++    int block[9];
++    _kernel_oserror *e;
++
++    if (icon != -1)
++        return;
++    memset(&menu, 0, sizeof menu);
++    strncpy(menu.title, "X server", sizeof menu.title);
++    menu.title_fg = 7;
++    menu.title_bg = 2;
++    menu.work_fg = 7;
++    menu.work_bg = 0;
++    menu.width = 11 * 16;
++    menu.height = MENU_ITEM_H;
++    menu.gap = 0;
++
++    block[0] = ICONBAR_RIGHT;
++    block[1] = 0;
++    block[2] = 0;
++    block[3] = RISCOS_LOGO_SIZE * 2;    /* mode 20 pixels: 2 OS units */
++    block[4] = RISCOS_LOGO_SIZE * 2;
++    /* sprite, centred both ways, indirected, click button type */
++    block[5] = 0x2 | 0x8 | 0x10 | 0x100 | (3 << 12);
++    block[6] = (int) logo_name;
++    block[7] = (int) riscos_logo_area;
++    block[8] = (int) strlen(logo_name);
++    if ((e = _swix(Wimp_CreateIcon, _IN(1) | _OUT(0), block, &icon))) {
++        LogMessage(X_WARNING, "RISC OS: no icon bar icon: %s\n", e->errmess);
++        icon = -1;
++    }
++}
++
++/* A Mouse_Click; returns non-zero if X has something to do. */
++int
++riscosIconbarClick(int *block)
++{
++    if (block[3] != ICONBAR_WINDOW || block[4] != icon || icon == -1)
++        return 0;
++    switch (block[2]) {
++    case BUTTON_MENU:
++        menu_x = block[0] - 64;
++        openMenu();
++        return 0;
++    case BUTTON_SELECT:
++        riscosShowWindow();
++        return 0;
++    default:
++        return 0;
++    }
++}
++
++/* A Menu_Selection: block[0] is the item chosen. */
++int
++riscosMenuSelection(int *block)
++{
++    int pointer[5], woken = 0;
++
++    switch (block[0]) {
++    case ITEM_FULLSCREEN:
++        woken = riscosToggleFullscreen();
++        break;
++    case ITEM_QUIT:
++        LogMessage(X_INFO, "RISC OS: Quit chosen; shutting down\n");
++        GiveUp(SIGTERM);
++        return 1;
++    default:
++        return 0;
++    }
++    if (_swix(Wimp_GetPointerInfo, _IN(1), pointer) == NULL &&
++        (pointer[2] & BUTTON_ADJUST))
++        openMenu();
++    return woken;
++}
+--- a/hw/kdrive/riscos/vcache.c	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/vcache.c	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,138 @@
++/*
++ * Xriscos: caching screen memory while X draws straight into it (full
++ * screen).
++ *
++ * RISC OS 3.7 maps screen memory bufferable but not cacheable. Writes are
++ * fast enough through the write buffer, but every read (CopyArea, scrolling,
++ * anything that blends) goes to VRAM a word at a time, and on a StrongARM
++ * that is far slower than reading cached memory, which comes in whole lines.
++ *
++ * So while X is running, between Wimp_Polls, the screen's pages are made
++ * cacheable (OS_Memory 0, cacheability control; it works on VRAM pages too).
++ * Just before each Wimp_Poll the data cache is cleaned, so what X drew
++ * reaches VRAM and the display, and the pages are made uncacheable again,
++ * so other tasks drawing on the screen meanwhile (menus, error boxes) are
++ * not held in the cache unseen.
++ *
++ * If AutoVCache is loaded, the screen is cacheable all the time and it
++ * cleans the cache now and then itself: then only the cleaning before each
++ * Wimp_Poll is done here, so X's drawing appears at once.
++ *
++ * -novcache turns all of this off.
++ */
++#ifdef HAVE_CONFIG_H
++#include <kdrive-config.h>
++#endif
++#include <stdlib.h>
++#include <kernel.h>
++#include <swis.h>
++#include "riscos.h"
++
++#define PAGE_SIZE       4096
++/* OS_Memory 0: logical addresses given; bits 14-15 cacheability control */
++#define MEM_LOGICAL     (1 << 9)
++#define MEM_UNCACHE     (2 << 14)
++#define MEM_CACHE       (3 << 14)
++
++Bool riscosVCacheEnabled = TRUE;
++
++static enum { VC_OFF, VC_TOGGLE, VC_CLEAN } vc_mode;
++static int *pages;              /* OS_Memory page blocks: 3 words each */
++static int npages;
++static int cached;              /* the pages are cacheable now */
++static unsigned long switches;
++
++static void
++cleanCache(void)
++{
++    /* The whole-cache form: cleans the data cache to memory. */
++    _swix(OS_SynchroniseCodeAreas, _IN(0), 0);
++}
++
++static void
++setCacheable(int on)
++{
++    _kernel_oserror *e;
++
++    if (on == cached)
++        return;
++    if (!on)
++        cleanCache();           /* nothing dirty may be left behind */
++    e = _swix(OS_Memory, _INR(0, 2),
++              MEM_LOGICAL | (on ? MEM_CACHE : MEM_UNCACHE), pages, npages);
++    if (e) {
++        LogMessage(X_WARNING, "RISC OS: cannot change the screen's caching "
++                   "(%s); drawing uncached\n", e->errmess);
++        vc_mode = VC_OFF;
++        return;
++    }
++    cached = on;
++    switches++;
++}
++
++/* X is drawing into bytes of screen memory from start. */
++void
++riscosVCacheStart(void *start, int bytes)
++{
++    unsigned long first = (unsigned long) start & ~(PAGE_SIZE - 1);
++    unsigned long end = ((unsigned long) start + bytes + PAGE_SIZE - 1) &
++        ~(PAGE_SIZE - 1);
++    int flags = 0, i;
++
++    riscosVCacheStop();
++    if (!riscosVCacheEnabled)
++        return;
++    if (_swix(OS_Module, _INR(0, 1) | _OUT(_FLAGS), 18, "AutoVCache",
++              &flags) == NULL) {
++        LogMessage(X_INFO, "RISC OS: AutoVCache is loaded; leaving the "
++                   "screen's caching to it\n");
++        vc_mode = VC_CLEAN;
++        return;
++    }
++    npages = (int) ((end - first) / PAGE_SIZE);
++    pages = calloc(npages, 3 * sizeof(int));
++    if (!pages)
++        return;
++    for (i = 0; i < npages; i++)
++        pages[3 * i + 1] = (int) (first + (unsigned long) i * PAGE_SIZE);
++    vc_mode = VC_TOGGLE;
++    switches = 0;
++    setCacheable(1);            /* X is running now */
++    if (vc_mode == VC_TOGGLE)
++        LogMessage(X_INFO, "RISC OS: screen memory cached while X draws "
++                   "(%d pages)\n", npages);
++}
++
++/* X no longer draws into screen memory. */
++void
++riscosVCacheStop(void)
++{
++    if (vc_mode == VC_TOGGLE)
++        setCacheable(0);
++    else if (vc_mode == VC_CLEAN)
++        cleanCache();
++    if (pages && switches)
++        LogMessage(X_INFO, "RISC OS: screen caching switched %lu times\n",
++                   switches);
++    free(pages);
++    pages = NULL;
++    npages = 0;
++    vc_mode = VC_OFF;
++}
++
++/* rwl's idle hook: idle is 1 just before Wimp_Poll, 0 just after. */
++void
++riscosVCacheIdle(int idle)
++{
++    switch (vc_mode) {
++    case VC_TOGGLE:
++        setCacheable(!idle);
++        break;
++    case VC_CLEAN:
++        if (idle)
++            cleanCache();
++        break;
++    default:
++        break;
++    }
++}
+--- a/hw/kdrive/riscos/xlogo.h	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/xlogo.h	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,65 @@
++/* Made by tools/mklogo.py: the X logo as a sprite area, for the icon bar. */
++static const unsigned riscos_logo_area[355] = {
++    0x0000058c, 0x00000001, 0x00000010, 0x0000058c, 0x0000057c, 0x676f6c78,
++    0x0000006f, 0x00000000, 0x00000004, 0x00000021, 0x00000000, 0x00000007,
++    0x0000002c, 0x000002d4, 0x00000014, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x77777740, 0x00000037, 0x00000000, 0x77200000,
++    0x00000004, 0x77777600, 0x00000177, 0x00000000, 0x57710000, 0x00000000,
++    0x77777100, 0x00000677, 0x00000000, 0x16760000, 0x00000000, 0x77773000,
++    0x00004777, 0x00000000, 0x02775000, 0x00000000, 0x77740000, 0x00037777,
++    0x00000000, 0x00377300, 0x00000000, 0x77600000, 0x00177777, 0x00000000,
++    0x00047720, 0x00000000, 0x77100000, 0x00677777, 0x00000000, 0x00006761,
++    0x00000000, 0x73000000, 0x04777777, 0x00000000, 0x00001676, 0x00000000,
++    0x40000000, 0x37777777, 0x40000000, 0x00000277, 0x00000000, 0x00000000,
++    0x77777776, 0x73000001, 0x00000037, 0x00000000, 0x00000000, 0x77777771,
++    0x77200006, 0x00000004, 0x00000000, 0x00000000, 0x77777730, 0x67610047,
++    0x00000000, 0x00000000, 0x00000000, 0x77777400, 0x16760377, 0x00000000,
++    0x00000000, 0x00000000, 0x77776000, 0x02774477, 0x00000000, 0x00000000,
++    0x00000000, 0x77771000, 0x00377367, 0x00000000, 0x00000000, 0x00000000,
++    0x77730000, 0x00067736, 0x00000000, 0x00000000, 0x00000000, 0x77600000,
++    0x00377763, 0x00000000, 0x00000000, 0x00000000, 0x37730000, 0x01777776,
++    0x00000000, 0x00000000, 0x00000000, 0x44772000, 0x06777777, 0x00000000,
++    0x00000000, 0x00000000, 0x30676100, 0x47777777, 0x00000000, 0x00000000,
++    0x00000000, 0x00167600, 0x77777774, 0x00000003, 0x00000000, 0x00000000,
++    0x00027740, 0x77777760, 0x00000017, 0x00000000, 0x00000000, 0x00003773,
++    0x77777710, 0x00000067, 0x00000000, 0x20000000, 0x00000477, 0x77777300,
++    0x00000477, 0x00000000, 0x61000000, 0x00000067, 0x77774000, 0x00003777,
++    0x00000000, 0x76000000, 0x00000016, 0x77760000, 0x00017777, 0x00000000,
++    0x77400000, 0x00000002, 0x77710000, 0x00067777, 0x00000000, 0x37730000,
++    0x00000000, 0x77300000, 0x00477777, 0x00000000, 0x05772000, 0x00000000,
++    0x74000000, 0x03777777, 0x00000000, 0x00676100, 0x00000000, 0x60000000,
++    0x17777777, 0x00000000, 0x00177500, 0x00000000, 0x10000000, 0x67777777,
++    0x00000000, 0x00027740, 0x00000000, 0x00000000, 0x77777773, 0x00000004,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xfffffff0, 0x000000ff,
++    0x00000000, 0xfff00000, 0x0000000f, 0xffffff00, 0x00000fff, 0x00000000,
++    0xffff0000, 0x00000000, 0xffffff00, 0x00000fff, 0x00000000, 0xffff0000,
++    0x00000000, 0xfffff000, 0x0000ffff, 0x00000000, 0x0ffff000, 0x00000000,
++    0xffff0000, 0x000fffff, 0x00000000, 0x00ffff00, 0x00000000, 0xfff00000,
++    0x00ffffff, 0x00000000, 0x000ffff0, 0x00000000, 0xfff00000, 0x00ffffff,
++    0x00000000, 0x0000ffff, 0x00000000, 0xff000000, 0x0fffffff, 0x00000000,
++    0x0000ffff, 0x00000000, 0xf0000000, 0xffffffff, 0xf0000000, 0x00000fff,
++    0x00000000, 0x00000000, 0xffffffff, 0xff00000f, 0x000000ff, 0x00000000,
++    0x00000000, 0xffffffff, 0xfff0000f, 0x0000000f, 0x00000000, 0x00000000,
++    0xfffffff0, 0xffff00ff, 0x00000000, 0x00000000, 0x00000000, 0xffffff00,
++    0xffff0fff, 0x00000000, 0x00000000, 0x00000000, 0xfffff000, 0x0fffffff,
++    0x00000000, 0x00000000, 0x00000000, 0xfffff000, 0x00ffffff, 0x00000000,
++    0x00000000, 0x00000000, 0xffff0000, 0x000fffff, 0x00000000, 0x00000000,
++    0x00000000, 0xfff00000, 0x00ffffff, 0x00000000, 0x00000000, 0x00000000,
++    0xffff0000, 0x0fffffff, 0x00000000, 0x00000000, 0x00000000, 0xfffff000,
++    0x0fffffff, 0x00000000, 0x00000000, 0x00000000, 0xf0ffff00, 0xffffffff,
++    0x00000000, 0x00000000, 0x00000000, 0x00ffff00, 0xffffffff, 0x0000000f,
++    0x00000000, 0x00000000, 0x000ffff0, 0xfffffff0, 0x000000ff, 0x00000000,
++    0x00000000, 0x0000ffff, 0xfffffff0, 0x000000ff, 0x00000000, 0xf0000000,
++    0x00000fff, 0xffffff00, 0x00000fff, 0x00000000, 0xff000000, 0x000000ff,
++    0xfffff000, 0x0000ffff, 0x00000000, 0xff000000, 0x000000ff, 0xffff0000,
++    0x000fffff, 0x00000000, 0xfff00000, 0x0000000f, 0xffff0000, 0x000fffff,
++    0x00000000, 0xffff0000, 0x00000000, 0xfff00000, 0x00ffffff, 0x00000000,
++    0x0ffff000, 0x00000000, 0xff000000, 0x0fffffff, 0x00000000, 0x00ffff00,
++    0x00000000, 0xf0000000, 0xffffffff, 0x00000000, 0x00ffff00, 0x00000000,
++    0xf0000000, 0xffffffff, 0x00000000, 0x000ffff0, 0x00000000, 0x00000000,
++    0xffffffff, 0x0000000f, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000,
++};
++#define RISCOS_LOGO_NAME "xlogo"
++#define RISCOS_LOGO_SIZE 34

@@ -47,7 +47,9 @@ with `XDev.RunX` (640x480 by default; edit `XDev.StartX` for `-screen WxH` or
 - It is shown in an ordinary window (title, close, back, toggle, size).
   Resizing the window resizes the X screen: once the size has held for
   250 ms, a work procedure swaps in a sprite of the new size, resizes the root
-  window and tells clients (RandR), as Xephyr does. The window can grow to the
+  window and tells clients (RandR: the screen change, the root's
+  ConfigureNotify, and the CRTC and output changes), as Xephyr does. The
+  window can grow to the
   size of the desktop (or the starting size, if bigger), and shrink to 64x64.
   RISC OS 3.70 draws a vertical scroll bar beside the size icon whatever the
   flags say; it is kept from scrolling.
@@ -70,8 +72,28 @@ with `XDev.RunX` (640x480 by default; edit `XDev.StartX` for `-screen WxH` or
   their two colours exactly; full-colour (ARGB) ones are reduced to
   transparent, white, black and grey; anything bigger than 32x32 is clipped
   around the hot spot. X no longer draws a cursor into the framebuffer.
-- Closing the window, or Message_Quit, shuts the server down.
-- The window and sprite are kept across server resets.
+- An icon bar icon (the X logo, `tools/mklogo.py` from xlogo's own drawing
+  code, as a 34x34 "2x2" sprite in the Wimp's greys, built into the server):
+  Select brings the window to the front, or opens it again after it was
+  closed; Menu gives Fullscreen (ticked while it is) and Quit. Closing the
+  window leaves X running; Quit, or Message_Quit, shuts it down.
+- Full screen, from the menu or Alt+Return (which switches back too; X never
+  sees that Return): a window with no furniture covers the desktop and X draws
+  straight into screen memory at the desktop's size, with no sprite and
+  nothing plotted. X's depth must be the desktop's (15 on a 32K-colour
+  desktop, 24 on 16M). When the Wimp reports part of that window lost (an
+  error box, say), X repaints it, background and Expose events, as for
+  uncovered windows. A mode change drops back to the window first, before X
+  can draw again. The cursor X thinks is showing is re-sent after each switch.
+- While X draws on the screen it is cacheable (`hw/kdrive/riscos/vcache.c`):
+  RISC OS 3.70 maps screen memory bufferable but uncached, so every read
+  (CopyArea, scrolling) is a slow uncached VRAM access. `OS_Memory` 0 makes
+  the screen's pages cacheable as each `Wimp_Poll` returns (rwl's idle hook);
+  just before the next one the data cache is cleaned (`OS_SynchroniseCodeAreas`)
+  and the pages made uncacheable again, so other tasks' drawing never sits in
+  the cache. With AutoVCache loaded, only the cleaning is done. `-novcache`
+  turns this off.
+- The window and sprite are kept across server resets; so is full screen.
 
 Tested on "My RiscPC" (16bpp desktop): `xlogo`, `xeyes`, `xclock -update 1`
 and a coloured `xterm` from Linux draw correctly; `xev` sees motion and all
@@ -93,6 +115,25 @@ and then 719x519, with the title, `xdpyinfo`, `xrandr` and a client polling
 redraw on the exposures; windows left outside a smaller screen are not moved
 (there is no window manager).
 
+Icon bar and full screen: the icon and menu appear as they should; Fullscreen
+(800x600 desktop) gave X an 800x600 screen with `xterm` and `xclock` drawn and
+updating straight onto the screen, `xdpyinfo` and RandR events following, and
+typing reaching the `xterm`. An error box over it was repainted when it went.
+Alt+Return went back to the window at its old place and size, and in again;
+the close icon hid the window and Select on the icon brought it back; Quit
+ended the server and removed the icon. `*WimpMode` to 640x480 while full
+screen put X back in its window. The page table entry for the screen goes
+from &FF6 (bufferable) to &FFE (cacheable, bufferable) and back, so
+`OS_Memory` does change VRAM pages on RISC OS 3.70; one on/clean/off cycle over
+the 235 pages of an 800x600 32K screen took about 150 us in the emulator,
+which does not model caches, so its cost on a real StrongARM is still to be
+measured.
+
+fvwm: fvwm 2.7 never follows a change of screen size (its RandR handling is
+compiled out, `#if 0` in `libs/FScreen.c`); `xev -root` shows the server
+sending RRScreenChangeNotify, ConfigureNotify on the root, and the CRTC and
+output changes, which RandR 1.2 clients (fvwm3, xfwm4, ...) use.
+
 Pointer: over an `xterm` the pointer is X's I-beam, over the root the X
 cursor, and off the window the RISC OS arrow with its own colours, with
 nothing drawn into the window. `xsetroot` with a core red-on-yellow `watch`
@@ -111,6 +152,8 @@ Not done yet:
 - RandR offers only the current size: clients cannot change it (`xrandr -s`);
   the window decides.
 - The window opens over the icon bar on a small desktop.
+- Full screen needs the desktop at X's depth; X's depth is fixed at start.
+- No Info window yet on the icon bar menu.
 - Untested on 256-colour and 32bpp desktops.
 
 ## Layout
@@ -129,7 +172,7 @@ Not done yet:
 | `xkb/make-xkm.sh` | Precompiles us/gb keymaps (evdev keycodes) on the build host |
 | `patches/` | Our changes to xorg-server 1.19.7, including the new `hw/kdrive/riscos` driver, as a diff |
 | `tools/keytest/` | Keyboard check: VNC key sender (`--type` too), the emulator's keysym table, and `keytest.py` |
-| `tools/` | `start-xvfb.sh`, `xping` (in-guest X handshake/GetImage test), `swicount.sh` (SWIs called from application space: shows busy-waiting), `waitdesk.sh`, VNC screenshot/click/key/mouse, CPU sampler |
+| `tools/` | `start-xvfb.sh`, `xping` (in-guest X handshake/GetImage test), `swicount.sh` (SWIs called from application space: shows busy-waiting), `waitdesk.sh`, VNC screenshot/click/key/mouse, CPU sampler, `mklogo.py` (the icon bar sprite, `hw/kdrive/riscos/xlogo.h`) |
 | `evloop/` | The Wimp_Poll event loop (`rwl`), its test task and results (Phase 2, step 1) |
 | `guest/` | RISC OS-side files for the machine's HostFS `XDev` folder: launchers (`RunX`, `RunXvfb`) and small BASIC helpers |
 | `phase0/` | Toolchain smoke test |

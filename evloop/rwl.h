@@ -71,6 +71,10 @@ unsigned rwl_key_overflows(void);
    that has no event of its own, such as tracking the pointer. */
 void rwl_set_null_interval(int ms);
 
+/* Call fn(1) just before every Wimp_Poll and fn(0) as soon as it returns,
+   before any event is handled: other tasks run only in between. */
+void rwl_set_idle_hook(void (*fn)(int idle));
+
 /* Put a socket in async, non-blocking mode so it wakes rwl_wait(). */
 int rwl_watch_socket(int fd);
 

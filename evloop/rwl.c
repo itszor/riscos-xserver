@@ -56,6 +56,7 @@ static rwl_handler handler;
 static void *handler_data;
 static int null_interval_ms;
 static void (*trace_fn)(const char *);
+static void (*idle_fn)(int idle);
 
 void
 rwl_set_trace(void (*fn)(const char *what))
@@ -118,6 +119,12 @@ rwl_set_handler(rwl_handler fn, void *data)
 {
 	handler = fn;
 	handler_data = data;
+}
+
+void
+rwl_set_idle_hook(void (*fn)(int idle))
+{
+	idle_fn = fn;
 }
 
 void
@@ -215,6 +222,8 @@ poll_once(int with_null, long deadline_ms, int use_deadline, int *woken)
 	if (!with_null && !use_deadline)
 		mask |= POLL_MASK_NULL;
 	st.polls++;
+	if (idle_fn != NULL)
+		idle_fn(1);
 	if (use_deadline) {
 		_swix(Wimp_PollIdle, _INR(0, 3) | _OUT(0), mask, poll_block,
 		      (int) (deadline_ms / 10), (int) blk, &reason);
@@ -222,6 +231,8 @@ poll_once(int with_null, long deadline_ms, int use_deadline, int *woken)
 		_swix(Wimp_Poll, _IN(0) | _IN(1) | _IN(3) | _OUT(0), mask,
 		      poll_block, (int) blk, &reason);
 	}
+	if (idle_fn != NULL)
+		idle_fn(0);
 	switch (reason) {
 	case REASON_NULL:
 		st.null_events++;

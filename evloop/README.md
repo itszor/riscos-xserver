@@ -22,6 +22,9 @@ The X server has to be a co-operative Wimp task, so it can't block in
 - Other Wimp events go to the handler set with `rwl_set_handler()`;
   `rwl_set_null_interval()` asks for null events (pointer tracking), and a
   handler that has queued work makes `rwl_wait` return `RWL_EVENT`.
+- `rwl_set_idle_hook()` registers a function called with 1 just before every
+  `Wimp_Poll` and 0 as soon as it returns, before any event is handled
+  (Xriscos makes screen memory cacheable only while it is running).
 - `rwl_shutdown()` (also run at exit) closes the task, disables the event and
   releases both vectors. The RMA block is freed only after both releases
   succeed.

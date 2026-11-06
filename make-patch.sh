@@ -14,7 +14,8 @@ files=(
     hw/kdrive/riscos/Makefile.am hw/kdrive/riscos/riscos.h
     hw/kdrive/riscos/riscos.c hw/kdrive/riscos/mouse.c
     hw/kdrive/riscos/kbd.c hw/kdrive/riscos/os.c hw/kdrive/riscos/cursor.c
-    hw/kdrive/riscos/riscosinit.c
+    hw/kdrive/riscos/riscosinit.c hw/kdrive/riscos/iconbar.c
+    hw/kdrive/riscos/vcache.c hw/kdrive/riscos/xlogo.h
 )
 [ -d "pristine/$V" ] || { mkdir -p pristine; tar xf "../sources/$V.tar.bz2" -C pristine; }
 : > "$OUT"
