@@ -179,7 +179,7 @@ the PC and nothing for one crosses the network:
 - Ordinary windows get a title bar (`_NET_WM_NAME` or `WM_NAME`, followed
   through an XACE property hook), back, close and toggle-size icons, and a
   size icon where RISC OS shows one without a scroll bar (3.70 doesn't). A
-  drag from the bottom right 5 pixels of a window resizes it, as the size
+  drag from the bottom right 8 pixels of a window resizes it, as the size
   icon would (`Wimp_DragBox` type 2), with X's `bottom_right_corner` cursor
   while the pointer is there; X doesn't see a press that starts there;
   override-redirect ones (menus, tooltips) none, and they are kept above
@@ -211,6 +211,14 @@ Found on the way (all fixed here):
 - **RISC OS 3.70 shows a window's size icon only beside a scroll bar**, and
   an X window has no use for one, so frames have none, and resize from
   their bottom right corner instead.
+- **Composite is off when rootless.** Composite redirects any ARGB window
+  (Firefox's popups, for one) and sets its pixmap's `screen_x`/`screen_y`;
+  in a frame that pixmap is the layer's scratch header, which went back to
+  the pool with the offset and was then used for another frame, so fb drew
+  and read that far outside the frame's sprite: corruption, then a data
+  abort in `fbBlt` when Firefox scrolled. XQuartz and XWin's multiwindow
+  mode go without Composite as well. `rootlessCommon.c` also clears the
+  offset whenever it takes a scratch header.
 
 Tested on "My RiscPC" with `-rootless`: `xterm` (core and Xft fonts),
 `xclock` (core and `-render`), and `xeyes` in each combination of Render,

@@ -439,7 +439,7 @@
 +#endif
 --- a/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,1383 @@
+@@ -0,0 +1,1392 @@
 +/*
 + * Xriscos: the kdrive X server for the RISC OS desktop.
 + *
@@ -483,6 +483,7 @@
 +#include "riscos.h"
 +#include "shadow.h"
 +#include "opaque.h"             /* display */
++#include "extinit.h"            /* noCompositeExtension */
 +#include "windowstr.h"
 +#include "inputstr.h"
 +
@@ -1569,6 +1570,14 @@
 +        if (riscosRootless)
 +            LogMessage(X_INFO, "RISC OS: rootless\n");
 +    }
++    /* Composite and the rootless layer can't share windows' pixmaps: a
++       redirected window (as Composite makes of any ARGB window, such as
++       Firefox's popups) gets its pixmap's screen_x/y set while that pixmap
++       is the layer's scratch header, which later draws another frame at
++       that offset, far outside its sprite. XQuartz and XWin's multiwindow
++       mode go without Composite too. InitExtensions comes after this. */
++    if (riscosRootless)
++        noCompositeExtension = TRUE;
 +    riscosIconbarInit();
 +    card->driver = &rd;
 +    return TRUE;
@@ -3004,7 +3013,7 @@
 +   no use for, so there it doesn't appear: a drag from the window's bottom
 +   right corner (CORNER_PIXELS) resizes it instead, as the icon would. */
 +#define FLAGS_DECORATED 0xaf000002u
-+#define CORNER_PIXELS   5
++#define CORNER_PIXELS   8
 +#define DRAG_SIZE       2       /* Wimp_DragBox: the window's size */
 +#define FLAGS_PLAIN     0x80000000u
 +
