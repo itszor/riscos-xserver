@@ -18,7 +18,9 @@ files=(
     hw/kdrive/riscos/vcache.c hw/kdrive/riscos/xlogo.h
     hw/kdrive/riscos/rootless.c hw/kdrive/riscos/options.c
     fb/fbpict.c miext/rootless/rootlessScreen.c
-    miext/rootless/rootlessCommon.h
+    miext/rootless/rootlessCommon.h miext/rootless/rootlessCommon.c
+    miext/rootless/rootlessWindow.c miext/rootless/rootlessGC.c
+    miext/rootless/rootless.h
 )
 [ -d "pristine/$V" ] || { mkdir -p pristine; tar xf "../sources/$V.tar.bz2" -C pristine; }
 : > "$OUT"
@@ -33,4 +35,12 @@ for f in "${files[@]}"; do
     cmp -s "patchcheck/$f" "$V/$f" || { echo "patch does not reproduce $f"; exit 1; }
 done
 rm -rf patchcheck
+# Any other changed source (not generated) must be listed above.
+missing=$(diff -rq "pristine/$V" "$V" 2>/dev/null |
+    sed -n "s|^Files pristine/$V/\(.*\) and .* differ$|\1|p" |
+    grep -E '\.(c|h|am|ac)$' | grep -v -E '(^|/)(config\.h|.*-config\.h)$' |
+    while read -r f; do
+        case " ${files[*]} " in *" $f "*) ;; *) echo "$f";; esac
+    done || true)
+[ -z "$missing" ] || { echo "changed but not in the patch's list:" $missing; exit 1; }
 echo "$OUT: $(grep -c '^+++ ' "$OUT") files, reproduces the tree"

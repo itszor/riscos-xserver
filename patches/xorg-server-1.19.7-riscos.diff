@@ -4321,3 +4321,207 @@
  // Returns TRUE if this window is visible inside a frame
  // (e.g. it is visible and has a top-level or root parent)
  Bool IsFramedWindow(WindowPtr pWin);
+--- a/miext/rootless/rootlessCommon.c	2019-02-02 09:32:48.000000000 +0000
++++ b/miext/rootless/rootlessCommon.c	2026-11-07 19:20:38.789943084 +0000
+@@ -166,8 +166,18 @@
+                                    top->drawable.depth,
+                                    top->drawable.bitsPerPixel,
+                                    winRec->bytesPerRow, winRec->pixelData);
++#ifdef COMPOSITE
++        /* A reused scratch header keeps the screen_x/y its last user gave
++           it (Composite sets them on a redirected window's pixmap); fb
++           would offset every access to this frame by them. */
++        winRec->pixmap->screen_x = 0;
++        winRec->pixmap->screen_y = 0;
++#endif
+         SetPixmapBaseToScreen(winRec->pixmap,
+                               top->drawable.x - bw, top->drawable.y - bw);
++        SetPixmapSizeToScreen(winRec->pixmap,
++                              top->drawable.x - bw, top->drawable.y - bw,
++                              winRec->width, winRec->height);
+ 
+         winRec->is_drawing = TRUE;
+     }
+@@ -248,6 +258,18 @@
+     if (winRec->is_drawing) {
+         SCREENREC(pScreen)->imp->StopDrawing(winRec->wid, flush);
+ 
++        /* The header goes back to the screen's scratch pool, for the next
++           GetScratchPixmapHeader (Render's AddGlyphs, PutImage paths...),
++           and ModifyPixmapHeader doesn't reset these: a drawable.x of 1,
++           left by SetPixmapBaseToScreen for a 16bpp frame at an odd
++           address, made each glyph uploaded through it one pixel short on
++           the left, and narrow ones (i, l) vanish. */
++        winRec->pixmap->drawable.x = 0;
++        winRec->pixmap->drawable.y = 0;
++#ifdef COMPOSITE
++        winRec->pixmap->screen_x = 0;
++        winRec->pixmap->screen_y = 0;
++#endif
+         FreeScratchPixmapHeader(winRec->pixmap);
+         TraverseTree(top, RestorePreDrawingPixmapVisitor, (void *) winRec);
+         winRec->pixmap = NULL;
+--- a/miext/rootless/rootlessWindow.c	2019-02-02 09:32:48.000000000 +0000
++++ b/miext/rootless/rootlessWindow.c	2026-11-07 19:49:46.308750941 +0000
+@@ -334,6 +334,8 @@
+ 
+             winRec->pixmap->devPrivate.ptr = winRec->pixelData;
+             SetPixmapBaseToScreen(winRec->pixmap, x - bw, y - bw);
++            SetPixmapSizeToScreen(winRec->pixmap, x - bw, y - bw,
++                                  winRec->width, winRec->height);
+         }
+     }
+ 
+@@ -778,11 +780,28 @@
+     else {
+         RootlessStartDrawing(pWin);
+ 
++        RootlessScrollFrameProc scroll = SCREENREC(pScreen)->imp->ScrollFrame;
++        WindowPtr top = TopLevelParent(pWin);
++        RootlessWindowRec *winRec = top ? WINREC(top) : NULL;
++
+         miCopyRegion((DrawablePtr) pWin, (DrawablePtr) pWin,
+                      0, &rgnDst, dx, dy, fbCopyWindowProc, 0, 0);
+ 
+-        /* prgnSrc has been translated to dst position */
+-        RootlessDamageRegion(pWin, prgnSrc);
++        /* What was copied can be shown by copying on screen (a child
++           window moved within its frame); the rest of prgnSrc, now at the
++           destination, is damaged. */
++        if (scroll && winRec && top != pWin && RegionNotEmpty(&rgnDst)) {
++            RegionTranslate(&rgnDst, -winRec->x, -winRec->y);
++            if (scroll(winRec->wid, RegionNumRects(&rgnDst),
++                       RegionRects(&rgnDst), dx, dy)) {
++                RegionTranslate(&rgnDst, winRec->x, winRec->y);
++                RegionSubtract(prgnSrc, prgnSrc, &rgnDst);
++            }
++            else
++                RegionTranslate(&rgnDst, winRec->x, winRec->y);
++        }
++        if (RegionNotEmpty(prgnSrc))
++            RootlessDamageRegion(pWin, prgnSrc);
+     }
+ 
+  out:
+@@ -1156,6 +1175,9 @@
+ 
+     for (i = 0; i < 2; i++) {
+         if (gResizeDeathPix[i] != NULL) {
++            /* back to the scratch pool clean (see RootlessStopDrawing) */
++            gResizeDeathPix[i]->drawable.x = 0;
++            gResizeDeathPix[i]->drawable.y = 0;
+             FreeScratchPixmapHeader(gResizeDeathPix[i]);
+             gResizeDeathPix[i] = NULL;
+         }
+--- a/miext/rootless/rootlessGC.c	2019-02-02 09:32:48.000000000 +0000
++++ b/miext/rootless/rootlessGC.c	2026-11-07 19:49:46.308421993 +0000
+@@ -538,6 +538,57 @@
+     RL_DEBUG_MSG("put image end\n");
+ }
+ 
++/*
++ * A plain copy from a window to itself, or to another window in the same
++ * frame (a scroll): fb has moved the frame's pixels, and the implementation
++ * can show it by moving what is on screen. Returns in *done the part of the
++ * destination box it took care of: where the source was in the window and
++ * the GC let the copy through; the rest is damaged as usual.
++ */
++static void
++RootlessScrollArea(DrawablePtr pSrc, DrawablePtr dst, GCPtr pGC,
++                   int srcx, int srcy, BoxPtr box, RegionPtr done)
++{
++    ScreenPtr pScreen = dst->pScreen;
++    RootlessScrollFrameProc scroll = SCREENREC(pScreen)->imp->ScrollFrame;
++    WindowPtr top;
++    RootlessWindowRec *winRec;
++    FbBits full = FbFullMask(dst->depth);
++    int dx, dy;
++
++    if (!scroll || pSrc->type != DRAWABLE_WINDOW ||
++        dst->type != DRAWABLE_WINDOW || pGC->alu != GXcopy ||
++        (pGC->planemask & full) != full ||
++        pGC->subWindowMode != ClipByChildren || pSrc->depth != dst->depth)
++        return;
++    top = TopLevelParent((WindowPtr) dst);
++    if (top == NULL || top != TopLevelParent((WindowPtr) pSrc))
++        return;
++    winRec = WINREC(top);
++    if (winRec == NULL)
++        return;
++
++    /* source = destination + dx, dy (screen coordinates) */
++    dx = (srcx + pSrc->x) - box->x1;
++    dy = (srcy + pSrc->y) - box->y1;
++
++    RegionReset(done, box);
++    RegionIntersect(done, done, pGC->pCompositeClip);
++    RegionTranslate(done, dx, dy);
++    RegionIntersect(done, done, &((WindowPtr) pSrc)->clipList);
++    RegionTranslate(done, -dx, -dy);
++    if (!RegionNotEmpty(done))
++        return;
++
++    RegionTranslate(done, -winRec->x, -winRec->y);
++    if (!scroll(winRec->wid, RegionNumRects(done), RegionRects(done),
++                dx, dy)) {
++        RegionEmpty(done);
++        return;
++    }
++    RegionTranslate(done, winRec->x, winRec->y);
++}
++
+ /* changed area is *dest* rect */
+ static RegionPtr
+ RootlessCopyArea(DrawablePtr pSrc, DrawablePtr dst, GCPtr pGC,
+@@ -571,8 +622,22 @@
+     box.y2 = box.y1 + h;
+ 
+     TRIM_BOX(box, pGC);
+-    if (BOX_NOT_EMPTY(box))
+-        RootlessDamageBox((WindowPtr) dst, &box);
++    if (BOX_NOT_EMPTY(box)) {
++        RegionRec done, rest;
++
++        RegionNull(&done);
++        RootlessScrollArea(pSrc, dst, pGC, srcx, srcy, &box, &done);
++        if (RegionNotEmpty(&done)) {
++            RegionInit(&rest, &box, 1);
++            RegionSubtract(&rest, &rest, &done);
++            if (RegionNotEmpty(&rest))
++                RootlessDamageRegion((WindowPtr) dst, &rest);
++            RegionUninit(&rest);
++        }
++        else
++            RootlessDamageBox((WindowPtr) dst, &box);
++        RegionUninit(&done);
++    }
+ 
+     GC_RESTORE(pGC, dst);
+     GCOP_WRAP(pGC);
+--- a/miext/rootless/rootless.h	2019-02-02 09:32:48.000000000 +0000
++++ b/miext/rootless/rootless.h	2026-11-07 19:49:46.308041279 +0000
+@@ -278,6 +278,16 @@
+ typedef void (*RootlessCopyWindowProc)
+  (RootlessFrameID wid, int dstNrects, const BoxRec * dstRects, int dx, int dy);
+ 
++/*
++ * Show a copy within a frame that X has already made in its pixels: the
++ * rectangles dstRects (frame coordinates) now hold what was dx, dy away
++ * (source = destination + dx, dy), so the implementation can copy what is
++ * on screen rather than redraw them. (Optional)
++ * Returns FALSE if it didn't, and the rectangles are damaged as usual.
++ */
++typedef Bool (*RootlessScrollFrameProc)
++ (RootlessFrameID wid, int dstNrects, const BoxRec * dstRects, int dx, int dy);
++
+ typedef void (*RootlessHideWindowProc)
+  (RootlessFrameID wid);
+ 
+@@ -311,6 +321,7 @@
+     /* Optional acceleration functions */
+     RootlessCopyBytesProc CopyBytes;
+     RootlessCopyWindowProc CopyWindow;
++    RootlessScrollFrameProc ScrollFrame;
+ } RootlessFrameProcsRec, *RootlessFrameProcsPtr;
+ 
+ /*
