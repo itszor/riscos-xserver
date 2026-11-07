@@ -2958,7 +2958,7 @@
 +#define RISCOS_LOGO_SIZE 34
 --- a/hw/kdrive/riscos/rootless.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/rootless.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,1064 @@
 +/*
 + * Xriscos rootless mode: each top-level X window is a RISC OS window.
 + *
@@ -3031,10 +3031,16 @@
 +    Bool open;                  /* the Wimp window is open */
 +    Bool title_stale;           /* WM_NAME may have changed */
 +    RegionRec damage;           /* drawn on since the last flush */
++    RegionRec issued;           /* flushed, and not yet redrawn */
++    RegionRec scroll;           /* to be copied on screen at the flush, */
++    int scroll_dx, scroll_dy;   /* from these offsets (see ScrollFrame) */
 +    char title[TITLE_LEN];
 +} RiscosFrame;
 +
 +static RiscosFrame *frames;
++
++static void frameScrollNow(RiscosFrame *f);
++static void frameScrollToDamage(RiscosFrame *f);
 +static ScreenPtr frame_screen;
 +
 +static WindowPtr
@@ -3418,6 +3424,8 @@
 +    f->y = newY;
 +    f->decorated = !pFrame->win->overrideRedirect;
 +    RegionNull(&f->damage);
++    RegionNull(&f->issued);
++    RegionNull(&f->scroll);
 +    if (!frameSprite(f, pFrame->width, pFrame->height)) {
 +        free(f);
 +        return FALSE;
@@ -3450,6 +3458,8 @@
 +    }
 +    riscosFrameGone(f->handle);
 +    RegionUninit(&f->damage);
++    RegionUninit(&f->issued);
++    RegionUninit(&f->scroll);
 +    free(f->area);
 +    free(f);
 +}
@@ -3475,6 +3485,7 @@
 +
 +    f->x = newX;
 +    f->y = newY;
++    frameScrollToDamage(f);
 +    /* The layer puts back what the window had, after this. */
 +    if (!frameSprite(f, newW, newH))
 +        LogMessage(X_ERROR, "RISC OS: no memory for a %ux%u window\n",
@@ -3514,6 +3525,7 @@
 +    if (f->open)
 +        _swix(Wimp_CloseWindow, _IN(1), &f->handle);
 +    f->open = FALSE;
++    RegionEmpty(&f->issued);
 +    riscosFrameGone(f->handle);
 +}
 +
@@ -3537,22 +3549,34 @@
 +        frameFlush((RiscosFrame *) wid);
 +}
 +
-+/* The frame's damage, flushed: Wimp_ForceRedraw for each box, or their
-+   extent when there are many. */
++
++/* The frame's damage, flushed: the pending scroll copied on screen, then
++   Wimp_ForceRedraw for each box of damage, or their extent when there are
++   many. */
 +static void
 +frameFlush(RiscosFrame *f)
 +{
 +    int xe = xeig(), ye = yeig();
-+    int n = RegionNumRects(&f->damage);
-+    BoxPtr box = RegionRects(&f->damage);
++    int n;
++    BoxPtr box;
 +
++    frameScrollNow(f);
++    n = RegionNumRects(&f->damage);
++    box = RegionRects(&f->damage);
 +    if (n == 0)
 +        return;
 +    if (f->open) {
 +        if (n > MAX_REDRAW_BOXES) {
++            RegionRec ext;
++
 +            box = RegionExtents(&f->damage);
 +            n = 1;
++            RegionInit(&ext, box, 1);
++            RegionUnion(&f->issued, &f->issued, &ext);
++            RegionUninit(&ext);
 +        }
++        else
++            RegionUnion(&f->issued, &f->issued, &f->damage);
 +        while (n--) {
 +            _swix(Wimp_ForceRedraw, _INR(0, 4), f->handle,
 +                  box->x1 << xe, -(box->y2 << ye),
@@ -3608,6 +3632,121 @@
 +    frameRedrawTitle(f);
 +}
 +
++/*
++ * Scrolling.
++ *
++ * X has copied rectangles of a frame's pixels within the frame: each
++ * destination now holds what was dx, dy away. Rather than redraw them from
++ * the sprite, copy what is on screen with Wimp_BlockCopy, which moves what
++ * is visible and asks for the rest to be redrawn.
++ *
++ * The copy waits for the flush, as damage does, so that a run of scrolls
++ * (a terminal scrolling line by line) costs one copy. f->scroll is where
++ * the screen's pixels, as they are now, are to be copied to, from
++ * scroll_dx, scroll_dy away; everything else that has changed is in
++ * f->damage. A new scroll is merged into it: the points it fills from
++ * pending copies' destinations become one copy by the summed offsets;
++ * anything else (fed from damage, or from where nothing was copied, or
++ * left behind by the pending copy) becomes damage. That is always safe:
++ * the sprite is up to date, and damage redraws from it.
++ */
++#define MAX_SCROLL_BOXES 8
++
++static void
++frameScrollToDamage(RiscosFrame *f)
++{
++    RegionUnion(&f->damage, &f->damage, &f->scroll);
++    RegionEmpty(&f->scroll);
++}
++
++static Bool
++riscosScrollFrame(RootlessFrameID wid, int n, const BoxRec *rects,
++                  int dx, int dy)
++{
++    RiscosFrame *f = (RiscosFrame *) wid;
++    RegionRec dst, keep, tmp;
++
++    if (!f->open)
++        return FALSE;
++    RegionInitBoxes(&dst, (BoxPtr) rects, n);
++    RegionNull(&keep);
++    RegionNull(&tmp);
++
++    /* keep: destinations whose source (p + dx, dy) is a pending copy's
++       destination (or, with none pending, anywhere) and not damaged */
++    RegionCopy(&keep, &dst);
++    RegionTranslate(&keep, dx, dy);
++    if (RegionNotEmpty(&f->scroll))
++        RegionIntersect(&keep, &keep, &f->scroll);
++    RegionSubtract(&keep, &keep, &f->damage);
++    RegionTranslate(&keep, -dx, -dy);
++
++    /* Everything else this scroll or the pending copy changes is damage */
++    RegionUnion(&tmp, &dst, &f->scroll);
++    RegionSubtract(&tmp, &tmp, &keep);
++    RegionUnion(&f->damage, &f->damage, &tmp);
++
++    if (RegionNotEmpty(&f->scroll)) {
++        f->scroll_dx += dx;
++        f->scroll_dy += dy;
++    }
++    else {
++        f->scroll_dx = dx;
++        f->scroll_dy = dy;
++    }
++    RegionCopy(&f->scroll, &keep);
++    if (RegionNumRects(&f->scroll) > MAX_SCROLL_BOXES ||
++        (f->scroll_dx == 0 && f->scroll_dy == 0))
++        frameScrollToDamage(f);
++
++    RegionUninit(&tmp);
++    RegionUninit(&keep);
++    RegionUninit(&dst);
++    return TRUE;
++}
++
++/* The pending copy, on screen. Where its source was still waiting to be
++   redrawn (issued), its destination is redrawn too, so stale pixels copied
++   there are replaced whatever the Wimp does with its invalid rectangles. */
++static void
++frameScrollNow(RiscosFrame *f)
++{
++    int xe = xeig(), ye = yeig();
++    int dx = f->scroll_dx, dy = f->scroll_dy;
++    int i, n, step;
++    BoxPtr b;
++    RegionRec stale;
++
++    if (!RegionNotEmpty(&f->scroll))
++        return;
++    if (!f->open) {
++        frameScrollToDamage(f);
++        return;
++    }
++    n = RegionNumRects(&f->scroll);
++    b = RegionRects(&f->scroll);
++    /* Boxes are banded top to bottom, left to right. Copy them in the
++       order that doesn't overwrite a source still to be copied: content
++       moves by -dx, -dy, so from the far end when it moves down or right */
++    step = (dy < 0 || (dy == 0 && dx < 0)) ? -1 : 1;
++    for (i = step > 0 ? 0 : n - 1; i >= 0 && i < n; i += step)
++        _swix(Wimp_BlockCopy, _INR(0, 6), f->handle,
++              (b[i].x1 + dx) << xe, -((b[i].y2 + dy) << ye),
++              (b[i].x2 + dx) << xe, -((b[i].y1 + dy) << ye),
++              b[i].x1 << xe, -(b[i].y2 << ye));
++
++    if (RegionNotEmpty(&f->issued)) {
++        RegionNull(&stale);
++        RegionCopy(&stale, &f->scroll);
++        RegionTranslate(&stale, dx, dy);
++        RegionIntersect(&stale, &stale, &f->issued);
++        RegionTranslate(&stale, -dx, -dy);
++        RegionUnion(&f->damage, &f->damage, &stale);
++        RegionUninit(&stale);
++    }
++    RegionEmpty(&f->scroll);
++}
++
 +static RootlessFrameProcsRec riscosFrameProcs = {
 +    riscosCreateFrame,
 +    riscosDestroyFrame,
@@ -3626,6 +3765,7 @@
 +    NULL,                       /* UpdateColormap */
 +    NULL,                       /* CopyBytes: fb's */
 +    NULL,                       /* CopyWindow: fb's */
++    riscosScrollFrame,
 +};
 +
 +/* ---- Wimp events for frames ---- */
@@ -3659,6 +3799,9 @@
 +        }
 +        e = _swix(Wimp_GetRectangle, _IN(1) | _OUT(0), block, &more);
 +    }
++    /* The Wimp has had everything it was asked to redraw */
++    if (e == NULL)
++        RegionEmpty(&f->issued);
 +}
 +
 +/* The user moved, resized, raised or lowered a frame: the Wimp window
@@ -3840,6 +3983,7 @@
 +    RiscosFrame *f;
 +
 +    for (f = frames; f; f = f->next) {
++        frameScrollToDamage(f);         /* the screen was redrawn */
 +        frameExtent(f);
 +        if (f->open)
 +            frameOpen(f, -3);
@@ -3854,8 +3998,16 @@
 +{
 +    KdScreenPriv(pScreen);
 +
++    char val[8];
++
 +    screen_bpp = pScreenPriv->screen->fb.bitsPerPixel;
 +    frame_screen = pScreen;
++    /* For comparisons: scroll by redrawing, as before Wimp_BlockCopy */
++    if (_kernel_getenv("Xriscos$NoBlockCopy", val, sizeof val) == NULL) {
++        riscosFrameProcs.ScrollFrame = NULL;
++        LogMessage(X_INFO, "RISC OS: scrolling by redrawing "
++                   "(Xriscos$NoBlockCopy is set)\n");
++    }
 +    if (!RootlessInit(pScreen, &riscosFrameProcs))
 +        return FALSE;
 +    /* fb's copies; there's nothing faster to call */

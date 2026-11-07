@@ -257,6 +257,47 @@ Rootless limitations:
 - Each window's sprite is in the server's own memory, about 2 bytes a pixel
   (32bpp: 4), within its WimpSlot.
 
+### Speed: scrolling and redraws
+
+Profiled on "My RiscPC" (sampling the ARM's PC through the debugger) with a
+client scrolling a 1200x700 window as fast as it could. Before:
+
+- on an 8bpp desktop, 42% of the time was SpriteExtend plotting the
+  window's 16bpp sprite through the 32K-entry colour table, the whole window
+  each time, as a scroll was damage to all of it; 28% was X moving the
+  sprite's pixels (`memcpy`), which a scroll needs anyway;
+- `rwl` polled with a high-priority pollword, which the Wimp reports before
+  redraws: under steady traffic it was nearly always set, and the window was
+  redrawn 13 times in 5 seconds while the client scrolled 1000 times.
+
+Now:
+
+- **The pollword is ordinary priority** (`evloop/rwl.c`): redraws come
+  between bursts of requests, 224-252 in those 5 seconds.
+- **Scrolls are copied on screen** with `Wimp_BlockCopy`. The rootless
+  layer has a new optional frame procedure, `ScrollFrame`, which
+  `RootlessCopyArea` (a plain copy within a frame) and `RootlessCopyWindow`
+  (a child window moved within its frame) call after fb has copied the
+  pixels; what it takes isn't damaged. `rootless.c` keeps one pending copy
+  per frame and does it at the flush, merging a run of scrolls into one
+  copy by their summed offset where that is exact and turning anything else
+  into damage (always safe: the sprite is current). Before copying it
+  redraws wherever a source was still waiting to be redrawn
+  (`issued`), so stale pixels are never moved.
+- Results (5 s of scrolling, 1360x768 desktop): at 8bpp, 194 scrolls/s
+  against 167, with 453 copies and no plotting time against 224 full
+  replots taking 33%; at 16bpp, where a replot is a plain copy, the two are
+  about even in RPCEmu (VRAM reads may cost more on a real machine).
+  `Set Xriscos$NoBlockCopy 1` before starting the server turns the copies
+  off, to compare.
+- Checked by reading the screen back through the debugger and comparing it
+  with the window's pixels from X: identical after 200 rapid scrolls,
+  including with another window covering part of it.
+
+Not yet done: a plotter of our own for 8bpp desktops (a 4K-entry table that
+fits the StrongARM's 16K data cache); URIconv (from !Boot) polls for null
+events all the time, which costs a task switch per poll.
+
 ## Layout
 
 | Path | What |

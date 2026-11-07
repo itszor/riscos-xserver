@@ -216,7 +216,11 @@ rwl_watch_socket(int fd)
 static int
 poll_once(int with_null, long deadline_ms, int use_deadline, int *woken)
 {
-	unsigned mask = POLL_SCAN_POLLWORD | POLL_POLLWORD_HIGH;
+	/* Not POLL_POLLWORD_HIGH: it puts the pollword ahead of redraws, and
+	   under steady network traffic (a client drawing all the time) the
+	   pollword is nearly always set, so windows went unredrawn until the
+	   traffic stopped. The pollword is looked at after every poll anyway. */
+	unsigned mask = POLL_SCAN_POLLWORD;
 	int reason = -1;
 
 	if (!with_null && !use_deadline)
