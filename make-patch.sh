@@ -16,6 +16,9 @@ files=(
     hw/kdrive/riscos/kbd.c hw/kdrive/riscos/os.c hw/kdrive/riscos/cursor.c
     hw/kdrive/riscos/riscosinit.c hw/kdrive/riscos/iconbar.c
     hw/kdrive/riscos/vcache.c hw/kdrive/riscos/xlogo.h
+    hw/kdrive/riscos/rootless.c hw/kdrive/riscos/options.c
+    fb/fbpict.c miext/rootless/rootlessScreen.c
+    miext/rootless/rootlessCommon.h
 )
 [ -d "pristine/$V" ] || { mkdir -p pristine; tar xf "../sources/$V.tar.bz2" -C pristine; }
 : > "$OUT"

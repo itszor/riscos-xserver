@@ -1,4 +1,4 @@
 | Run by RunX as a new Wimp task: size its slot, then become the X server.
 | stderr goes to <Obey$Dir>.xlog.
 WimpSlot -min 8000K -max 8000K
-Run <Obey$Dir>.Xriscos :0 -listen tcp -ac -xkbdir xkb -screen 640x480 2> xlog
+Run <Obey$Dir>.Xriscos :0 -listen tcp -ac -xkbdir xkb -screen 640x480 %*0 2> xlog

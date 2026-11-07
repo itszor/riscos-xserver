@@ -39,7 +39,8 @@ mouse and keyboard work.** See "Xriscos" below.
 
 A kdrive server (`hw/kdrive/riscos`, built with `--enable-xriscos`). Start it
 with `XDev.RunX` (640x480 by default; edit `XDev.StartX` for `-screen WxH` or
-`WxHx24`).
+`WxHx24`). Arguments to `RunX` are passed on to the server, as in
+`Obey XDev.RunX -rootless`.
 
 - The X screen is a RISC OS sprite, 16bpp (X depth 15) or 32bpp (depth 24),
   which fb draws into directly: the X visual's masks follow RISC OS's pixel
@@ -94,6 +95,12 @@ with `XDev.RunX` (640x480 by default; edit `XDev.StartX` for `-screen WxH` or
   the cache. With AutoVCache loaded, only the cleaning is done. `-novcache`
   turns this off.
 - The window and sprite are kept across server resets; so is full screen.
+- **Rootless** (icon bar menu, saved in `Choices:Xriscos.Options`, or
+  `<Xriscos$Dir>.Options` without a `Choices$Write`; `-rootless` and
+  `-norootless` override it for a run): each top-level X window is a RISC OS
+  window of its own, and the X screen is the desktop. It takes effect when
+  the server next starts (a server can't change between the two while it
+  runs). See *Rootless mode*, below.
 
 Tested on "My RiscPC" (16bpp desktop): `xlogo`, `xeyes`, `xclock -update 1`
 and a coloured `xterm` from Linux draw correctly; `xev` sees motion and all
@@ -155,6 +162,72 @@ Not done yet:
 - Full screen needs the desktop at X's depth; X's depth is fixed at start.
 - No Info window yet on the icon bar menu.
 - Untested on 256-colour and 32bpp desktops.
+
+## Rootless mode
+
+Built on xorg-server's generic rootless layer (`miext/rootless`, as used by
+XQuartz and XWin's `-mwextwm`), which gives every mapped top-level window a
+"frame" with its own backing buffer. `hw/kdrive/riscos/rootless.c` makes a
+frame a Wimp window and a sprite in the X screen's format: fb draws into the
+sprite, the layer's damage becomes `Wimp_ForceRedraw` when it flushes, and
+redraw requests plot the sprite. The X root window is never shown, and costs
+one row of pixels (the layer's `RootlessUpdateScreenPixmap`).
+
+The Wimp is the window manager, on the ARM, so no X window manager runs on
+the PC and nothing for one crosses the network:
+
+- Ordinary windows get a title bar (`_NET_WM_NAME` or `WM_NAME`, followed
+  through an XACE property hook), back, close, toggle-size and size icons;
+  override-redirect ones (menus, tooltips) none, and they are kept above
+  the others.
+- Moving, resizing, raising or lowering a window on the desktop
+  reconfigures the X window (`ConfigureWindow`, as XWin does); X's own
+  moves and restacking move the Wimp window, and where the Wimp keeps a
+  window on screen the X window is moved to match.
+- The close icon sends `WM_DELETE_WINDOW` when the client takes it, and
+  otherwise disconnects the client, as xkill would.
+- Clicking a window brings it to the front and gives it the caret and the X
+  input focus. The pointer is reported to X in desktop coordinates while it
+  is over an X window (or a button is held), and is X's cursor there.
+
+Found on the way (all fixed here):
+
+- **Render was lost in frames.** The rootless layer points a framed window's
+  pixmap at the frame's pixels with its base moved back to the screen's
+  origin, but leaves the pixmap the frame's size, and fb bounds the pixman
+  image for a picture by the pixmap's size. So Render drew nothing in a
+  window away from the top left of the screen, and could write outside the
+  frame near it. `fb/fbpict.c` now makes the image reach the window.
+- **Render trapezoids and triangles** go straight to pixman in fb, and the
+  layer didn't wrap them, so they drew into the hidden root (xeyes' eyes).
+  `miext/rootless/rootlessScreen.c` now wraps them, as it does Composite.
+- **Flushing:** the layer reports damage with `DamageRects` and asks for it to
+  be shown with `UpdateRegion(NULL)` or with `StopDrawing(flush)`, depending
+  on whether the frame was being drawn on; both must flush.
+- **RISC OS 3.70 shows a window's size icon only beside a scroll bar**, so
+  decorated frames have a vertical one, which does nothing.
+
+Tested on "My RiscPC" with `-rootless`: `xterm` (core and Xft fonts),
+`xclock` (core and `-render`), and `xeyes` in each combination of Render,
+Present and Shape each appear as their own window, titled, where the
+client put them, and draw and redraw correctly; dragging the title bar moved
+the X window to match (40,60 to 100,211), the size icon resized it (to
+239x276, xterm redrawing), typing reached the xterm with its title showing
+the focus, xterm's Ctrl+click menu opened as an undecorated window, the
+close icon closed an xeyes, and scrolling output displayed at once. The
+menu item saved the option, the server came up rootless from it, and
+unticking it said the change would come at the next start.
+
+Rootless limitations:
+
+- Shaped windows are shown whole (RISC OS 3.7 has no shaped windows).
+- X only knows where the pointer is while it's over an X window.
+- No window placement: windows open where their clients ask (the Wimp keeps
+  them on screen). No iconising, and no `_NET_WM` hints.
+- A mode change reopens the windows where they were, but the X screen keeps
+  its size.
+- Each window's sprite is in the server's own memory, about 2 bytes a pixel
+  (32bpp: 4), within its WimpSlot.
 
 ## Layout
 

@@ -295,12 +295,14 @@
  	$(AM_V_at)for i in $(SERVER_SUBDIRS) ; do $(MAKE) -C $$i relink || exit 1 ; done
 --- a/hw/kdrive/riscos/Makefile.am	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/Makefile.am	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,43 @@
 +# Xriscos: the kdrive X server for the RISC OS desktop. The X screen is a
 +# sprite shown in a Wimp window; see riscos.c.
 +AM_CPPFLAGS = 					\
 +	@KDRIVE_INCS@				\
-+	@KDRIVE_CFLAGS@
++	@KDRIVE_CFLAGS@				\
++	-I$(top_srcdir)/miext/rootless		\
++	-I$(top_srcdir)/Xext
 +
 +noinst_LTLIBRARIES = libriscos.la
 +
@@ -310,6 +312,8 @@
 +	riscos.c	\
 +	riscos.h	\
 +	iconbar.c	\
++	rootless.c	\
++	options.c	\
 +	vcache.c	\
 +	xlogo.h		\
 +	mouse.c		\
@@ -322,6 +326,7 @@
 +
 +Xriscos_LDADD = 					\
 +	libriscos.la					\
++	$(top_builddir)/miext/rootless/librootless.la	\
 +	@KDRIVE_MAIN_LIB@				\
 +	@KDRIVE_LIBS@
 +
@@ -329,13 +334,14 @@
 +
 +Xriscos_DEPENDENCIES =	\
 +	libriscos.la					\
++	$(top_builddir)/miext/rootless/librootless.la	\
 +	@KDRIVE_LOCAL_LIBS@
 +
 +relink:
 +	$(AM_V_at)rm -f $(bin_PROGRAMS) && $(MAKE) $(bin_PROGRAMS)
 --- a/hw/kdrive/riscos/riscos.h	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscos.h	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,91 @@
 +/*
 + * Xriscos: the kdrive X server for the RISC OS desktop.
 + *
@@ -398,6 +404,28 @@
 +int riscosIconbarClick(int *block);
 +int riscosMenuSelection(int *block);
 +
++/* Rootless mode: each top-level X window a RISC OS window (rootless.c). */
++extern Bool riscosRootless;             /* this run */
++extern int riscosRootlessArg;           /* -rootless 1, -norootless 0, or -1 */
++Bool riscosRootlessInit(ScreenPtr pScreen);
++/* A Wimp event for a frame: -1 if it isn't one's, else non-zero if X has
++   work to do. */
++int riscosRootlessEvent(int reason, int *block);
++Bool riscosIsFrameWindow(int handle);
++void riscosFrameFocus(int handle);      /* it has the caret */
++void riscosFrameClick(int handle);      /* clicked: to the front */
++void riscosRootlessModeChange(void);
++/* riscos.c, for rootless.c */
++void riscosFrameGone(int handle);
++void *riscosColourTable(void);
++/* The icon bar menu's Rootless item */
++void riscosToggleRootless(void);
++
++/* Options kept between runs (options.c). */
++extern Bool riscosOptRootless;
++void riscosOptionsLoad(void);
++Bool riscosOptionsSave(void);
++
 +/* Caching screen memory while X draws into it (vcache.c). */
 +extern Bool riscosVCacheEnabled;        /* -novcache clears it */
 +void riscosVCacheStart(void *start, int bytes);
@@ -407,7 +435,7 @@
 +#endif
 --- a/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscos.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,1212 @@
+@@ -0,0 +1,1343 @@
 +/*
 + * Xriscos: the kdrive X server for the RISC OS desktop.
 + *
@@ -433,6 +461,10 @@
 + * the Wimp asks for part of that window to be redrawn (after an error box,
 + * say), X is asked to repaint it, as for exposed windows. While X runs the
 + * screen is made cacheable (vcache.c).
++ *
++ * Rootless mode (rootless.c, the Rootless option) has no such window: each
++ * top-level X window is a RISC OS window of its own, and the X screen is
++ * the desktop.
 + *
 + * Based on hw/kdrive/fake (Keith Packard).
 + */
@@ -518,7 +550,14 @@
 +    int normal_state[9];        /* the normal window, before full screen */
 +    RegionRec expose;           /* to repaint, once X can (full screen) */
 +    int expose_queued;
++    int pointer_window;         /* the window the pointer last entered */
++    int desk_h;                 /* the desktop's height, OS units */
 +} rd;
++
++/* Rootless this run: from the options, or -rootless/-norootless. Decided
++   once, at the first card initialisation; a server reset keeps it. */
++Bool riscosRootless;
++int riscosRootlessArg = -1;
 +
 +static int riscosEvent(int reason, int *block, void *data);
 +
@@ -563,6 +602,7 @@
 +
 +    rd.xeig = readModeVar(VAR_XEIG);
 +    rd.yeig = readModeVar(VAR_YEIG);
++    rd.desk_h = (readModeVar(VAR_YWINDLIMIT) + 1) << rd.yeig;
 +    rd.desk_log2bpp = readModeVar(VAR_LOG2BPP);
 +    free(rd.table);
 +    rd.table = NULL;
@@ -582,6 +622,24 @@
 +                       "%d-colour desktop; colours will be wrong\n",
 +                       1 << (1 << rd.desk_log2bpp));
 +    }
++}
++
++/* The colour translation for plotting X's pixels on this desktop, or NULL
++   if none is needed. */
++void *
++riscosColourTable(void)
++{
++    return rd.table;
++}
++
++/* A window that shows X: the normal or full screen one, or a frame. */
++static Bool
++riscosOurWindow(int handle)
++{
++    if (handle <= 0)
++        return FALSE;
++    return handle == rd.normal || handle == rd.full ||
++        (riscosRootless && riscosIsFrameWindow(handle));
 +}
 +
 +/* Make the sprite that is the X framebuffer. */
@@ -1255,16 +1313,25 @@
 +    int block[5], x, y, buttons;
 +    unsigned long flags = 0;
 +
-+    if (!riscosPointer || !rd.window)
++    if (!riscosPointer || (!rd.window && !riscosRootless))
 +        return 0;
 +    if (_swix(Wimp_GetPointerInfo, _IN(1), block) != NULL)
 +        return 0;
 +    /* Over another window: report nothing, unless a button is held down,
 +       when X expects to see the drag go on (it is clamped to the screen). */
-+    if (block[3] != rd.window && rd.last_buttons == 0)
-+        return 0;
-+    x = (block[0] - (rd.vis[0] - rd.scroll[0])) >> rd.xeig;
-+    y = ((rd.vis[3] - rd.scroll[1]) - block[1]) >> rd.yeig;
++    if (riscosRootless) {
++        if (!riscosIsFrameWindow(block[3]) && rd.last_buttons == 0)
++            return 0;
++        /* X's screen is the desktop */
++        x = block[0] >> rd.xeig;
++        y = (rd.desk_h - 1 - block[1]) >> rd.yeig;
++    }
++    else {
++        if (block[3] != rd.window && rd.last_buttons == 0)
++            return 0;
++        x = (block[0] - (rd.vis[0] - rd.scroll[0])) >> rd.xeig;
++        y = ((rd.vis[3] - rd.scroll[1]) - block[1]) >> rd.yeig;
++    }
 +    if (x < 0) x = 0;
 +    if (y < 0) y = 0;
 +    if (x >= rd.scr_w) x = rd.scr_w - 1;
@@ -1302,14 +1369,26 @@
 +    case Redraw_Window_Request:
 +        /* An error box, say, puts the Wimp's pointer back without the
 +           pointer leaving the window: X's comes back with the redraw. */
-+        if (block[0] == rd.window && rd.pointer_inside)
++        if (rd.pointer_inside && block[0] == rd.pointer_window)
 +            riscosCursorEnter(rd.xeig, rd.yeig);
++        if (riscosRootless) {
++            int r = riscosRootlessEvent(reason, block);
++
++            if (r >= 0)
++                return r;
++        }
 +        if (block[0] == rd.normal)
 +            riscosRedraw(block, FALSE);
 +        else if (block[0] == rd.full)
 +            return riscosRedrawFull(block);
 +        return 0;
 +    case Open_Window_Request:
++        if (riscosRootless) {
++            int r = riscosRootlessEvent(reason, block);
++
++            if (r >= 0)
++                return r;
++        }
 +        /* Only the window showing X: after a mode change the Wimp asks
 +           again for windows that may have been closed since. */
 +        if (block[0] != rd.window)
@@ -1329,6 +1408,12 @@
 +        }
 +        return 0;
 +    case Close_Window_Request:
++        if (riscosRootless) {
++            int r = riscosRootlessEvent(reason, block);
++
++            if (r >= 0)
++                return r;
++        }
 +        /* X carries on; Select on the icon bar icon opens it again. */
 +        if (block[0] == rd.normal) {
 +            _swix(Wimp_CloseWindow, _IN(1), block);
@@ -1337,21 +1422,30 @@
 +        }
 +        return 0;
 +    case Pointer_Entering_Window:
-+        if (block[0] != rd.window)
++        if (!(riscosRootless ? riscosIsFrameWindow(block[0])
++                             : block[0] == rd.window))
 +            return 0;
 +        rd.pointer_inside = 1;
++        rd.pointer_window = block[0];
 +        riscosCursorEnter(rd.xeig, rd.yeig);
 +        riscosSetNullInterval();
 +        return riscosPollPointer();
 +    case Pointer_Leaving_Window:
-+        if (block[0] != rd.window)
++        if (!rd.pointer_inside || block[0] != rd.pointer_window)
 +            return 0;
 +        rd.pointer_inside = 0;
 +        riscosCursorLeave();
 +        riscosSetNullInterval();        /* still polled while a button is held */
 +        return riscosPollPointer();
 +    case Mouse_Click:
-+        if (block[3] == rd.window) {
++        if (riscosRootless && riscosIsFrameWindow(block[3])) {
++            /* The caret, so the keys, and to the front */
++            _swix(Wimp_SetCaretPosition, _INR(0, 5), block[3], -1, 0, 0,
++                  1 << 25, -1);
++            riscosFrameClick(block[3]);
++            return riscosPollPointer() | 1;
++        }
++        if (block[3] == rd.window && rd.window) {
 +            /* Take the input focus, with no visible caret. */
 +            riscosTakeFocus();
 +            return riscosPollPointer();
@@ -1363,15 +1457,20 @@
 +        /* With the focus, keys reach X through KeyV (rwl), as presses and
 +           releases of physical keys; the Wimp's translated copy is not
 +           wanted. Anything else is passed on. */
-+        if (block[0] != rd.normal && block[0] != rd.full)
++        if (!riscosOurWindow(block[0]))
 +            _swix(Wimp_ProcessKey, _IN(0), block[6]);
 +        return 0;
 +    case Gain_Caret:
-+        if (block[0] == rd.normal || block[0] == rd.full)
++        if (riscosOurWindow(block[0])) {
 +            rwl_key_capture(1);
++            if (riscosRootless) {
++                riscosFrameFocus(block[0]);
++                return 1;
++            }
++        }
 +        return 0;
 +    case Lose_Caret:
-+        if (block[0] != rd.normal && block[0] != rd.full)
++        if (!riscosOurWindow(block[0]))
 +            return 0;
 +        rwl_key_capture(0);
 +        return riscosKeysReleaseAll();
@@ -1381,6 +1480,8 @@
 +    case User_Message_Recorded:
 +        if (block[4] == Message_ModeChange) {
 +            riscosReadMode();
++            if (riscosRootless)
++                riscosRootlessModeChange();
 +            if (rd.fullscreen) {
 +                /* The screen memory X draws into may have moved: back to
 +                   the window now, before X draws again. */
@@ -1405,6 +1506,7 @@
 +Bool
 +riscosCardInit(KdCardInfo * card)
 +{
++    static Bool mode_decided;
 +    const char *why = "";
 +    char name[48];
 +
@@ -1415,9 +1517,40 @@
 +    }
 +    rwl_set_handler(riscosEvent, NULL);
 +    rwl_set_idle_hook(riscosVCacheIdle);
++    if (!mode_decided) {
++        riscosOptionsLoad();
++        riscosRootless = riscosRootlessArg >= 0 ? riscosRootlessArg
++                                                : riscosOptRootless;
++        mode_decided = TRUE;
++        if (riscosRootless)
++            LogMessage(X_INFO, "RISC OS: rootless\n");
++    }
 +    riscosIconbarInit();
 +    card->driver = &rd;
 +    return TRUE;
++}
++
++/* A frame's window has closed or gone (rootless.c). */
++void
++riscosFrameGone(int handle)
++{
++    if (rd.pointer_inside && rd.pointer_window == handle)
++        riscosForgetPointer();
++}
++
++/* The icon bar menu's Rootless: the option for the next start. */
++void
++riscosToggleRootless(void)
++{
++    riscosOptRootless = !riscosOptRootless;
++    if (!riscosOptionsSave())
++        riscosReportError("The option could not be saved.");
++    else if (riscosOptRootless != riscosRootless)
++        riscosReportError(riscosOptRootless ?
++            "The X server will be rootless, each X window a RISC OS "
++            "window, from the next time it starts." :
++            "The X server will show its screen in one window again from "
++            "the next time it starts.");
 +}
 +
 +Bool
@@ -1455,6 +1588,26 @@
 +
 +    riscosReadMode();
 +    screen->fb.shadow = FALSE;          /* fb draws straight in */
++    if (riscosRootless) {
++        /* The X screen is the desktop, and its root window is never
++           shown: the rootless layer replaces the screen pixmap with one
++           row (RootlessUpdateScreenPixmap) before anything draws on it.
++           A one-row sprite stands in until then, and gives the colour
++           table for plotting the frames' sprites, which are its format. */
++        screen->width = readModeVar(VAR_XWINDLIMIT) + 1;
++        screen->height = readModeVar(VAR_YWINDLIMIT) + 1;
++        if (!riscosMakeSprite(screen->width, 1, screen->fb.bitsPerPixel)) {
++            free(scrpriv);
++            screen->driver = NULL;
++            return FALSE;
++        }
++        screen->fb.frameBuffer = rd.pixels;
++        screen->fb.byteStride = rd.stride;
++        screen->fb.pixelStride = rd.stride * 8 / screen->fb.bitsPerPixel;
++        rd.scr_w = screen->width;
++        rd.scr_h = screen->height;
++        return TRUE;
++    }
 +    if (rd.on_screen) {
 +        /* A server reset while full screen: carry on drawing on it. */
 +        int w, h, stride;
@@ -1538,7 +1691,11 @@
 +Bool
 +riscosFinishInitScreen(ScreenPtr pScreen)
 +{
-+    if (!shadowSetup(pScreen))
++    if (riscosRootless) {
++        if (!riscosRootlessInit(pScreen))
++            return FALSE;
++    }
++    else if (!shadowSetup(pScreen))
 +        return FALSE;
 +#ifdef RANDR
 +    {
@@ -1558,6 +1715,8 @@
 +riscosCreateResources(ScreenPtr pScreen)
 +{
 +    rd.screen = pScreen;
++    if (riscosRootless)
++        return TRUE;            /* the rootless layer tracks its frames */
 +    /* Damage tracking only: the update tells the Wimp what changed. */
 +    return shadowAdd(pScreen, pScreen->GetScreenPixmap(pScreen),
 +                     riscosShadowUpdate, riscosWindowLinear, 0, NULL);
@@ -1672,7 +1831,7 @@
 +};
 --- a/hw/kdrive/riscos/kbd.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/kbd.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,155 @@
 +/*
 + * Xriscos keyboard.
 + *
@@ -1682,7 +1841,8 @@
 + * its evdev (Linux) key code, which is what the precompiled keymaps use, so
 + * the X keycode is that plus 8 (minScanCode 0, KD_MIN_KEYCODE 8).
 + *
-+ * Alt+Return is kept from X: it switches full screen on and off.
++ * Alt+Return is kept from X: it switches full screen on and off (except
++ * when rootless, which has no full screen).
 + */
 +#ifdef HAVE_CONFIG_H
 +#include <kdrive-config.h>
@@ -1743,7 +1903,7 @@
 +        if (code == 0 || !riscosKeyboard)
 +            continue;
 +        if (code == EVDEV_RETURN) {
-+            if (pressed && !key_down[code] &&
++            if (pressed && !key_down[code] && !riscosRootless &&
 +                (key_down[EVDEV_LEFTALT] || key_down[EVDEV_RIGHTALT])) {
 +                return_swallowed = 1;
 +                queued |= riscosToggleFullscreen();
@@ -2165,7 +2325,7 @@
 +}
 --- a/hw/kdrive/riscos/riscosinit.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/riscosinit.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,166 @@
 +/* Xriscos: kdrive entry points. Based on hw/kdrive/fake/fakeinit.c. */
 +#ifdef HAVE_CONFIG_H
 +#include <kdrive-config.h>
@@ -2271,6 +2431,9 @@
 +    ErrorF("\nXriscos options:\n");
 +    ErrorF("-keylog                report each RISC OS key event and its mapping\n");
 +    ErrorF("-novcache              full screen: leave screen memory uncached\n");
++    ErrorF("-rootless              each X window a RISC OS window, whatever the\n"
++           "                       option saved from the icon bar menu says\n");
++    ErrorF("-norootless            the X screen in one window, likewise\n");
 +}
 +
 +int
@@ -2278,6 +2441,14 @@
 +{
 +    if (!strcmp(argv[i], "-keylog")) {
 +        riscosKeyLog = TRUE;
++        return 1;
++    }
++    if (!strcmp(argv[i], "-rootless")) {
++        riscosRootlessArg = 1;
++        return 1;
++    }
++    if (!strcmp(argv[i], "-norootless")) {
++        riscosRootlessArg = 0;
 +        return 1;
 +    }
 +    if (!strcmp(argv[i], "-novcache")) {
@@ -2323,7 +2494,7 @@
 +};
 --- a/hw/kdrive/riscos/iconbar.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/kdrive/riscos/iconbar.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,152 @@
 +/*
 + * Xriscos: the icon bar icon and its menu.
 + *
@@ -2331,7 +2502,8 @@
 + * the server's own sprite area, so nothing needs loading into the Wimp's
 + * sprite pool. Select brings the X window to the front (opening it again if
 + * it was closed); Menu gives the usual icon bar menu: Fullscreen (ticked
-+ * while it is) and Quit. Adjust on a menu item leaves the menu open.
++ * while it is), Rootless (ticked if the X server is to be rootless from its
++ * next start: an option saved between runs) and Quit. Adjust on a menu item leaves the menu open.
 + */
 +#ifdef HAVE_CONFIG_H
 +#include <kdrive-config.h>
@@ -2350,7 +2522,11 @@
 +#define BUTTON_MENU     2
 +#define BUTTON_ADJUST   1
 +
-+enum { ITEM_FULLSCREEN, ITEM_QUIT, N_ITEMS };
++enum { ITEM_FULLSCREEN, ITEM_ROOTLESS, ITEM_QUIT, N_ITEMS };
++
++#define ITEM_TICKED     1
++#define ITEM_LAST       0x80
++#define ICON_SHADED     0x00400000
 +
 +typedef struct {
 +    int flags, submenu, icon_flags;
@@ -2369,19 +2545,25 @@
 +static char logo_name[] = RISCOS_LOGO_NAME;
 +
 +static void
-+setItem(int i, const char *text, int flags)
++setItem(int i, const char *text, int flags, Bool shaded)
 +{
 +    menu.item[i].flags = flags;
 +    menu.item[i].submenu = -1;
-+    menu.item[i].icon_flags = 0x07000021;   /* text, filled, black on white */
++    /* text, filled, black on white */
++    menu.item[i].icon_flags = 0x07000021 | (shaded ? ICON_SHADED : 0);
 +    strncpy(menu.item[i].text, text, sizeof menu.item[i].text);
 +}
 +
 +static void
 +openMenu(void)
 +{
-+    setItem(ITEM_FULLSCREEN, "Fullscreen", riscosIsFullscreen() ? 1 : 0);
-+    setItem(ITEM_QUIT, "Quit", 0x80);       /* last item */
++    /* No full screen when rootless: there's no X screen to show */
++    setItem(ITEM_FULLSCREEN, "Fullscreen",
++            riscosIsFullscreen() ? ITEM_TICKED : 0, riscosRootless);
++    /* Ticked as saved, for the next start */
++    setItem(ITEM_ROOTLESS, "Rootless", riscosOptRootless ? ITEM_TICKED : 0,
++            FALSE);
++    setItem(ITEM_QUIT, "Quit", ITEM_LAST, FALSE);
 +    _swix(Wimp_CreateMenu, _INR(1, 3), &menu, menu_x,
 +          96 + MENU_ITEM_H * N_ITEMS);
 +}
@@ -2447,7 +2629,11 @@
 +
 +    switch (block[0]) {
 +    case ITEM_FULLSCREEN:
-+        woken = riscosToggleFullscreen();
++        if (!riscosRootless)
++            woken = riscosToggleFullscreen();
++        break;
++    case ITEM_ROOTLESS:
++        riscosToggleRootless();
 +        break;
 +    case ITEM_QUIT:
 +        LogMessage(X_INFO, "RISC OS: Quit chosen; shutting down\n");
@@ -2670,3 +2856,1152 @@
 +};
 +#define RISCOS_LOGO_NAME "xlogo"
 +#define RISCOS_LOGO_SIZE 34
+--- a/hw/kdrive/riscos/rootless.c	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/rootless.c	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,879 @@
++/*
++ * Xriscos rootless mode: each top-level X window is a RISC OS window.
++ *
++ * Built on the generic rootless layer (miext/rootless), which gives every
++ * mapped top-level window a "frame" with its own backing buffer and calls
++ * the functions here to create, move, resize, restack and redisplay it.
++ * Here a frame is a Wimp window and a sprite: fb draws into the sprite (in
++ * the X screen's pixel format, as the rooted mode's framebuffer is), the
++ * layer's updates become Wimp_ForceRedraw, and redraw requests plot it.
++ *
++ * The Wimp is the window manager, on the ARM, so that no X window manager
++ * has to run on the PC or talk over the network: a frame for an ordinary
++ * window has a title bar (WM_NAME), back, close, toggle-size and size icons;
++ * one for an override-redirect window (a menu, a tooltip) has none. When
++ * the user moves, resizes, raises or lowers a frame, the X window follows
++ * (ConfigureWindow, as XWin's -mwextwm does); closing one asks the client
++ * to delete it (WM_DELETE_WINDOW) or, failing that, disconnects it;
++ * clicking one gives it the caret and the X input focus.
++ *
++ * The X root window is the size of the desktop and is never shown; X
++ * coordinates are desktop pixels, from the top left.
++ */
++#ifdef HAVE_CONFIG_H
++#include <kdrive-config.h>
++#endif
++#include <stdlib.h>
++#include <string.h>
++#include <kernel.h>
++#include <swis.h>
++#include <X11/Xatom.h>
++#include "riscos.h"
++#include "rootless.h"
++#include "windowstr.h"
++#include "propertyst.h"
++#include "inputstr.h"
++#include "xace.h"
++#include "xacestr.h"
++
++/* Wimp event reason codes */
++#define Redraw_Window_Request   1
++#define Open_Window_Request     2
++#define Close_Window_Request    3
++
++#define WIMP_TOP        (-1)    /* Wimp_OpenWindow "behind": on top */
++#define WIMP_BOTTOM     (-2)    /*   at the bottom */
++#define TITLE_LEN       128
++#define MAX_REDRAW_BOXES 16
++
++/* Window flags: new-style, moveable, with back, close, title, toggle-size
++   and size icons; or none of them, for override-redirect windows. RISC OS
++   3.7 shows the size icon only beside a scroll bar, so there's a vertical
++   one, which does nothing: the work area is always the whole window. */
++#define FLAGS_DECORATED 0xbf000002u
++#define FLAGS_PLAIN     0x80000000u
++
++typedef struct RiscosFrame {
++    struct RiscosFrame *next;
++    RootlessWindowPtr rl;       /* the layer's frame record */
++    int handle;                 /* Wimp window */
++    int *area;                  /* sprite area with one sprite */
++    int *sprite;
++    CARD8 *pixels;
++    int stride;
++    int w, h;                   /* the sprite's size, pixels */
++    int x, y;                   /* the frame's position, X pixels */
++    Bool decorated;
++    Bool open;                  /* the Wimp window is open */
++    Bool title_stale;           /* WM_NAME may have changed */
++    RegionRec damage;           /* drawn on since the last flush */
++    char title[TITLE_LEN];
++} RiscosFrame;
++
++static RiscosFrame *frames;
++static ScreenPtr frame_screen;
++
++static WindowPtr
++rd_root(void)
++{
++    return frame_screen ? frame_screen->root : NULL;
++}
++static int screen_bpp;
++/* Set while the X window is being made to follow its frame (the user
++   moved it): the frame functions then leave the Wimp window alone. */
++static int native_change;
++static Atom atom_net_wm_name, atom_utf8, atom_wm_protocols,
++    atom_wm_delete_window;
++static Bool title_work_queued;
++
++static void raiseOverrides(void);
++
++/* ---- Geometry ---- */
++
++static int
++modeVar(int var)
++{
++    int value = 0;
++
++    _swix(OS_ReadModeVariable, _INR(0, 1) | _OUT(2), -1, var, &value);
++    return value;
++}
++
++static int xeig(void) { return modeVar(4); }
++static int yeig(void) { return modeVar(5); }
++/* The desktop's height, OS units */
++static int deskHeight(void) { return (modeVar(12) + 1) << yeig(); }
++
++/* The Wimp visible area for a frame at x, y, w x h X pixels */
++static void
++frameVisible(int x, int y, int w, int h, int vis[4])
++{
++    int xe = xeig(), ye = yeig(), top = deskHeight();
++
++    vis[0] = x << xe;
++    vis[1] = top - ((y + h) << ye);
++    vis[2] = (x + w) << xe;
++    vis[3] = top - (y << ye);
++}
++
++static RiscosFrame *
++frameForHandle(int handle)
++{
++    RiscosFrame *f;
++
++    for (f = frames; f; f = f->next)
++        if (f->handle == handle)
++            return f;
++    return NULL;
++}
++
++Bool
++riscosIsFrameWindow(int handle)
++{
++    return handle > 0 && frameForHandle(handle) != NULL;
++}
++
++/* ---- The sprite ---- */
++
++static Bool
++frameSprite(RiscosFrame *f, int w, int h)
++{
++    int stride, image, total, *area, *s;
++    int xdpi = 180 >> xeig(), ydpi = 180 >> yeig();
++
++    if (w < 1)
++        w = 1;
++    if (h < 1)
++        h = 1;
++    if (f->area && f->w == w && f->h == h)
++        return TRUE;
++    stride = ((w * screen_bpp + 31) >> 5) << 2;
++    image = stride * h;
++    total = 16 + 44 + image;
++    area = malloc(total);
++    if (!area)
++        return FALSE;
++    /* Black to start with: a window with no background shows what's here
++       until its client draws (malloc's memory could be an old frame's). */
++    memset(area, 0, total);
++    area[0] = total;
++    area[1] = 1;
++    area[2] = 16;
++    area[3] = total;
++    s = area + 4;
++    s[0] = 44 + image;
++    memset(&s[1], 0, 12);
++    strcpy((char *) &s[1], "frame");
++    s[4] = stride / 4 - 1;
++    s[5] = h - 1;
++    s[6] = 0;
++    s[7] = (w * screen_bpp - 1) & 31;
++    s[8] = 44;
++    s[9] = 44;
++    s[10] = ((screen_bpp == 32 ? 6 : 5) << 27) | (ydpi << 14) |
++        (xdpi << 1) | 1;
++    free(f->area);
++    f->area = area;
++    f->sprite = s;
++    f->pixels = (CARD8 *) s + 44;
++    f->stride = stride;
++    f->w = w;
++    f->h = h;
++    return TRUE;
++}
++
++/* ---- The Wimp window ---- */
++
++static void
++frameExtent(RiscosFrame *f)
++{
++    int ext[4];
++    int sw = (modeVar(11) + 1) << xeig(), sh = deskHeight();
++    int w = f->w << xeig(), h = f->h << yeig();
++
++    ext[0] = 0;
++    ext[1] = -(h > sh ? h : sh);
++    ext[2] = w > sw ? w : sw;
++    ext[3] = 0;
++    _swix(Wimp_SetExtent, _INR(0, 1), f->handle, ext);
++}
++
++static Bool
++frameCreateWindow(RiscosFrame *f)
++{
++    int block[23];
++    _kernel_oserror *e;
++
++    memset(block, 0, sizeof block);
++    frameVisible(f->x, f->y, f->w, f->h, block);
++    block[6] = WIMP_TOP;
++    block[7] = (int) (f->decorated ? FLAGS_DECORATED : FLAGS_PLAIN);
++    ((char *) block)[32] = 7;           /* title foreground */
++    ((char *) block)[33] = 2;           /* title background */
++    ((char *) block)[34] = 7;
++    ((char *) block)[35] = (char) 0xff; /* work area: we paint it all */
++    ((char *) block)[36] = 3;
++    ((char *) block)[37] = 1;
++    ((char *) block)[38] = 12;          /* title background with focus */
++    block[11] = -(f->h << yeig());
++    block[12] = f->w << xeig();
++    block[14] = f->decorated ? 0x13d : 0;       /* indirected text title */
++    block[15] = 10 << 12;               /* work area: click/drag */
++    block[16] = 1;
++    block[17] = (1 << xeig()) | ((1 << yeig()) << 16);  /* minimum size */
++    block[18] = (int) f->title;
++    block[19] = -1;
++    block[20] = TITLE_LEN;
++    block[21] = 0;
++    if ((e = _swix(Wimp_CreateWindow, _IN(1) | _OUT(0), block, &f->handle))) {
++        LogMessage(X_ERROR, "RISC OS: cannot create a window: %s\n",
++                   e->errmess);
++        f->handle = 0;
++        return FALSE;
++    }
++    frameExtent(f);
++    return TRUE;
++}
++
++/* Open (or reopen) the window where the frame is, behind the given window
++   (WIMP_TOP, or -3 to keep its place). */
++static void
++frameOpen(RiscosFrame *f, int behind)
++{
++    int block[9];
++
++    block[0] = f->handle;
++    if (behind == -3) {
++        if (_swix(Wimp_GetWindowState, _IN(1), block) != NULL)
++            return;
++        behind = (block[8] & (1 << 16)) ? block[7] : WIMP_TOP;
++    }
++    frameVisible(f->x, f->y, f->w, f->h, &block[1]);
++    block[5] = 0;
++    block[6] = 0;
++    block[7] = behind;
++    _swix(Wimp_OpenWindow, _IN(1), block);
++    f->open = TRUE;
++}
++
++/* The X position of a frame's window as the Wimp has it, which may differ
++   from where X put it: the Wimp keeps windows on the screen. */
++static void
++frameReadPosition(RiscosFrame *f, int *x, int *y, int *w, int *h)
++{
++    int block[9];
++
++    block[0] = f->handle;
++    *x = f->x;
++    *y = f->y;
++    *w = f->w;
++    *h = f->h;
++    if (_swix(Wimp_GetWindowState, _IN(1), block) != NULL)
++        return;
++    *x = block[1] >> xeig();
++    *y = (deskHeight() - block[4]) >> yeig();
++    *w = (block[3] - block[1]) >> xeig();
++    *h = (block[4] - block[2]) >> yeig();
++}
++
++/* ---- Making X follow ---- */
++
++/* Configure the frame's X window to the Wimp window's geometry, and
++   restack it if asked (Above, Below, or -1 not). */
++static void
++frameConfigureX(RiscosFrame *f, int stack)
++{
++    WindowPtr win = f->rl->win;
++    int x, y, w, h, bw = wBorderWidth(win), n = 0;
++    XID vlist[5];
++    Mask mask = 0;
++
++    frameReadPosition(f, &x, &y, &w, &h);
++    if (x != f->rl->x || y != f->rl->y) {
++        mask |= CWX | CWY;
++        vlist[n++] = x;
++        vlist[n++] = y;
++    }
++    if (w != (int) f->rl->width || h != (int) f->rl->height) {
++        mask |= CWWidth | CWHeight;
++        vlist[n++] = w - 2 * bw > 0 ? w - 2 * bw : 1;
++        vlist[n++] = h - 2 * bw > 0 ? h - 2 * bw : 1;
++    }
++    if (stack >= 0) {
++        mask |= CWStackMode;
++        vlist[n++] = stack;
++    }
++    if (!mask)
++        return;
++    native_change++;
++    ConfigureWindow(win, mask, vlist, wClient(win));
++    native_change--;
++}
++
++/* A work procedure: X moves frames the Wimp didn't put where X asked. */
++static Bool
++syncWork(ClientPtr client, void *closure)
++{
++    RiscosFrame *f;
++
++    for (f = frames; f; f = f->next)
++        if (f->open && f->rl && f->rl->win) {
++            int x, y, w, h;
++
++            frameReadPosition(f, &x, &y, &w, &h);
++            if (x != f->rl->x || y != f->rl->y)
++                frameConfigureX(f, -1);
++        }
++    return TRUE;
++}
++
++static void
++queueSync(void)
++{
++    QueueWorkProc(syncWork, serverClient, NULL);
++}
++
++/* ---- Titles ---- */
++
++/* WM_NAME, or _NET_WM_NAME (UTF-8, here as Latin-1 where it can be) */
++static void
++frameReadTitle(RiscosFrame *f)
++{
++    WindowPtr win = f->rl ? f->rl->win : NULL;
++    PropertyPtr prop;
++    const unsigned char *s;
++    char *d = f->title;
++    int n, i;
++    Bool utf8 = FALSE;
++
++    f->title_stale = FALSE;
++    f->title[0] = '\0';
++    if (!win)
++        return;
++    if (dixLookupProperty(&prop, win, atom_net_wm_name, serverClient,
++                          DixReadAccess) == Success &&
++        prop->format == 8 && prop->type == atom_utf8)
++        utf8 = TRUE;
++    else if (dixLookupProperty(&prop, win, XA_WM_NAME, serverClient,
++                               DixReadAccess) != Success ||
++             prop->format != 8)
++        return;
++    s = prop->data;
++    n = prop->size;
++    for (i = 0; i < n && d < f->title + TITLE_LEN - 1; i++) {
++        unsigned c = s[i];
++
++        if (utf8 && c >= 0x80) {
++            /* two-byte sequences for U+0080-U+00FF; else '?' */
++            if ((c == 0xC2 || c == 0xC3) && i + 1 < n) {
++                c = ((c & 0x1F) << 6) | (s[++i] & 0x3F);
++            } else {
++                while (i + 1 < n && (s[i + 1] & 0xC0) == 0x80)
++                    i++;
++                c = '?';
++            }
++        }
++        if (c < 0x20)
++            c = ' ';
++        *d++ = (char) c;
++    }
++    *d = '\0';
++}
++
++static void
++frameRedrawTitle(RiscosFrame *f)
++{
++    int block[9];
++
++    if (!f->open || !f->decorated)
++        return;
++    block[0] = f->handle;
++    if (_swix(Wimp_GetWindowState, _IN(1), block) != NULL)
++        return;
++    /* the title bar is above the visible area: 48 OS units is enough */
++    _swix(Wimp_ForceRedraw, _INR(0, 4), -1, block[1], block[4],
++          block[3], block[4] + 48);
++}
++
++static Bool
++titleWork(ClientPtr client, void *closure)
++{
++    RiscosFrame *f;
++
++    title_work_queued = FALSE;
++    for (f = frames; f; f = f->next)
++        if (f->title_stale) {
++            char old[TITLE_LEN];
++
++            strcpy(old, f->title);
++            frameReadTitle(f);
++            if (strcmp(old, f->title))
++                frameRedrawTitle(f);
++        }
++    return TRUE;
++}
++
++/* XACE: a property is about to be read or changed. If it's a title, look
++   at it again once the request is done. */
++static void
++propertyAccess(CallbackListPtr *pcbl, void *data, void *calldata)
++{
++    XacePropertyAccessRec *rec = calldata;
++    PropertyPtr prop = *rec->ppProp;
++    RiscosFrame *f;
++
++    if (!(rec->access_mode & (DixWriteAccess | DixBlendAccess |
++                              DixCreateAccess | DixDestroyAccess)) ||
++        !prop || !rec->pWin || !rec->pWin->parent ||
++        rec->pWin->parent->parent ||    /* top-level windows only */
++        (prop->propertyName != XA_WM_NAME &&
++         prop->propertyName != atom_net_wm_name))
++        return;
++    for (f = frames; f; f = f->next)
++        if (f->rl && f->rl->win == rec->pWin) {
++            f->title_stale = TRUE;
++            if (!title_work_queued) {
++                title_work_queued = TRUE;
++                QueueWorkProc(titleWork, serverClient, NULL);
++            }
++        }
++}
++
++/* ---- The rootless layer's frame functions ---- */
++
++static Bool
++riscosCreateFrame(RootlessWindowPtr pFrame, ScreenPtr pScreen,
++                  int newX, int newY, RegionPtr pNewShape)
++{
++    RiscosFrame *f = calloc(1, sizeof *f);
++
++    if (!f)
++        return FALSE;
++    f->rl = pFrame;
++    f->x = newX;
++    f->y = newY;
++    f->decorated = !pFrame->win->overrideRedirect;
++    RegionNull(&f->damage);
++    if (!frameSprite(f, pFrame->width, pFrame->height)) {
++        free(f);
++        return FALSE;
++    }
++    frameReadTitle(f);
++    if (!frameCreateWindow(f)) {
++        free(f->area);
++        free(f);
++        return FALSE;
++    }
++    f->next = frames;
++    frames = f;
++    pFrame->wid = (RootlessFrameID) f;
++    return TRUE;
++}
++
++static void
++riscosDestroyFrame(RootlessFrameID wid)
++{
++    RiscosFrame *f = (RiscosFrame *) wid, **pp;
++
++    for (pp = &frames; *pp; pp = &(*pp)->next)
++        if (*pp == f) {
++            *pp = f->next;
++            break;
++        }
++    if (f->handle) {
++        _swix(Wimp_CloseWindow, _IN(1), &f->handle);
++        _swix(Wimp_DeleteWindow, _IN(1), &f->handle);
++    }
++    riscosFrameGone(f->handle);
++    RegionUninit(&f->damage);
++    free(f->area);
++    free(f);
++}
++
++static void
++riscosMoveFrame(RootlessFrameID wid, ScreenPtr pScreen, int newX, int newY)
++{
++    RiscosFrame *f = (RiscosFrame *) wid;
++
++    f->x = newX;
++    f->y = newY;
++    if (f->open && !native_change) {
++        frameOpen(f, -3);
++        queueSync();
++    }
++}
++
++static void
++riscosResizeFrame(RootlessFrameID wid, ScreenPtr pScreen, int newX, int newY,
++                  unsigned int newW, unsigned int newH, unsigned int gravity)
++{
++    RiscosFrame *f = (RiscosFrame *) wid;
++
++    f->x = newX;
++    f->y = newY;
++    /* The layer puts back what the window had, after this. */
++    if (!frameSprite(f, newW, newH))
++        LogMessage(X_ERROR, "RISC OS: no memory for a %ux%u window\n",
++                   newW, newH);
++    frameExtent(f);
++    if (f->open && !native_change) {
++        frameOpen(f, -3);
++        queueSync();
++    }
++    if (f->open)
++        _swix(Wimp_ForceRedraw, _INR(0, 4), f->handle, 0,
++              -(f->h << yeig()), f->w << xeig(), 0);
++}
++
++static void
++riscosRestackFrame(RootlessFrameID wid, RootlessFrameID nextWid)
++{
++    RiscosFrame *f = (RiscosFrame *) wid, *above = (RiscosFrame *) nextWid;
++
++    if (native_change && f->open)
++        return;                 /* the Wimp has it already */
++    frameOpen(f, above && above->open ? above->handle : WIMP_TOP);
++    queueSync();
++}
++
++static void
++riscosReshapeFrame(RootlessFrameID wid, RegionPtr pNewShape)
++{
++    /* RISC OS 3.7 windows are rectangles: shaped windows show whole. */
++}
++
++static void
++riscosUnmapFrame(RootlessFrameID wid)
++{
++    RiscosFrame *f = (RiscosFrame *) wid;
++
++    if (f->open)
++        _swix(Wimp_CloseWindow, _IN(1), &f->handle);
++    f->open = FALSE;
++    riscosFrameGone(f->handle);
++}
++
++static void
++riscosStartDrawing(RootlessFrameID wid, char **pixelData, int *bytesPerRow)
++{
++    RiscosFrame *f = (RiscosFrame *) wid;
++
++    *pixelData = (char *) f->pixels;
++    *bytesPerRow = f->stride;
++}
++
++/* The layer's flush comes here when the frame was being drawn on, and to
++   UpdateRegion(NULL) when it wasn't. */
++static void frameFlush(RiscosFrame *f);
++
++static void
++riscosStopDrawing(RootlessFrameID wid, Bool flush)
++{
++    if (flush)
++        frameFlush((RiscosFrame *) wid);
++}
++
++/* The frame's damage, flushed: Wimp_ForceRedraw for each box, or their
++   extent when there are many. */
++static void
++frameFlush(RiscosFrame *f)
++{
++    int xe = xeig(), ye = yeig();
++    int n = RegionNumRects(&f->damage);
++    BoxPtr box = RegionRects(&f->damage);
++
++    if (n == 0)
++        return;
++    if (f->open) {
++        if (n > MAX_REDRAW_BOXES) {
++            box = RegionExtents(&f->damage);
++            n = 1;
++        }
++        while (n--) {
++            _swix(Wimp_ForceRedraw, _INR(0, 4), f->handle,
++                  box->x1 << xe, -(box->y2 << ye),
++                  box->x2 << xe, -(box->y1 << ye));
++            box++;
++        }
++    }
++    RegionEmpty(&f->damage);
++}
++
++/* The layer says what was drawn on (DamageRects), and when to show it
++   (UpdateRegion, with NULL for "what you've been told"). */
++static void
++riscosUpdateRegion(RootlessFrameID wid, RegionPtr pDamage)
++{
++    RiscosFrame *f = (RiscosFrame *) wid;
++
++    if (pDamage)
++        RegionUnion(&f->damage, &f->damage, pDamage);
++    frameFlush(f);
++}
++
++static void
++riscosDamageRects(RootlessFrameID wid, int nrects, const BoxRec *rects,
++                  int shift_x, int shift_y)
++{
++    RiscosFrame *f = (RiscosFrame *) wid;
++
++    while (nrects--) {
++        BoxRec box;
++        RegionRec r;
++
++        box.x1 = rects->x1 + shift_x;
++        box.y1 = rects->y1 + shift_y;
++        box.x2 = rects->x2 + shift_x;
++        box.y2 = rects->y2 + shift_y;
++        rects++;
++        if (box.x1 >= box.x2 || box.y1 >= box.y2)
++            continue;
++        RegionInit(&r, &box, 1);
++        RegionUnion(&f->damage, &f->damage, &r);
++        RegionUninit(&r);
++    }
++}
++
++static void
++riscosSwitchWindow(RootlessWindowPtr pFrame, WindowPtr oldWin)
++{
++    RiscosFrame *f = (RiscosFrame *) pFrame->wid;
++
++    f->rl = pFrame;
++    frameReadTitle(f);
++    frameRedrawTitle(f);
++}
++
++static RootlessFrameProcsRec riscosFrameProcs = {
++    riscosCreateFrame,
++    riscosDestroyFrame,
++    riscosMoveFrame,
++    riscosResizeFrame,
++    riscosRestackFrame,
++    riscosReshapeFrame,
++    riscosUnmapFrame,
++    riscosStartDrawing,
++    riscosStopDrawing,
++    riscosUpdateRegion,
++    riscosDamageRects,
++    riscosSwitchWindow,
++    NULL,                       /* DoReorderWindow */
++    NULL,                       /* HideWindow */
++    NULL,                       /* UpdateColormap */
++    NULL,                       /* CopyBytes: fb's */
++    NULL,                       /* CopyWindow: fb's */
++};
++
++/* ---- Wimp events for frames ---- */
++
++static void
++frameRedraw(RiscosFrame *f, int *block)
++{
++    int more = 0;
++    _kernel_oserror *e = _swix(Wimp_RedrawWindow, _IN(1) | _OUT(0), block,
++                               &more);
++    void *table = riscosColourTable();
++
++    while (e == NULL && more) {
++        int ox = block[1] - block[5], oy = block[4] - block[6];
++        int right = ox + (f->w << xeig()), bottom = oy - (f->h << yeig());
++
++        _swix(OS_SpriteOp, _INR(0, 7), 52 + 512, f->area, f->sprite,
++              ox, bottom, 0, 0, table);
++        /* Where the window is bigger than the sprite (being resized),
++           black. block[7-10] is the graphics window. */
++        if (block[9] >= right || block[8] < bottom) {
++            _swix(ColourTrans_SetGCOL, _IN(0) | _INR(3, 4), 0, 0, 0);
++            if (block[9] >= right) {
++                _swix(OS_Plot, _INR(0, 2), 4, right, block[8]);
++                _swix(OS_Plot, _INR(0, 2), 96 + 5, block[9], block[10]);
++            }
++            if (block[8] < bottom) {
++                _swix(OS_Plot, _INR(0, 2), 4, block[7], block[8]);
++                _swix(OS_Plot, _INR(0, 2), 96 + 5, block[9], bottom - 1);
++            }
++        }
++        e = _swix(Wimp_GetRectangle, _IN(1) | _OUT(0), block, &more);
++    }
++}
++
++/* The user moved, resized, raised or lowered a frame: the Wimp window
++   goes where asked, and the X window follows. */
++static void
++frameOpenRequest(RiscosFrame *f, int *block)
++{
++    int behind = block[7], stack = -1;
++
++    block[5] = 0;               /* no scrolling: the work area is the window */
++    block[6] = 0;
++    _swix(Wimp_OpenWindow, _IN(1), block);
++    f->open = TRUE;
++    if (behind == WIMP_TOP)
++        stack = Above;
++    else if (behind == WIMP_BOTTOM)
++        stack = Below;
++    frameConfigureX(f, stack);
++    if (stack == Above && f->decorated)
++        raiseOverrides();
++}
++
++/* The close icon: WM_DELETE_WINDOW if the client takes it, as a window
++   manager would send; otherwise disconnect the client, as xkill does. */
++static void
++frameCloseRequest(RiscosFrame *f)
++{
++    WindowPtr win = f->rl ? f->rl->win : NULL;
++    PropertyPtr prop;
++    ClientPtr client;
++
++    if (!win)
++        return;
++    client = wClient(win);
++    if (dixLookupProperty(&prop, win, atom_wm_protocols, serverClient,
++                          DixReadAccess) == Success && prop->format == 32) {
++        CARD32 *atoms = prop->data;
++        int i;
++
++        for (i = 0; i < prop->size; i++)
++            if (atoms[i] == atom_wm_delete_window) {
++                xEvent ev;
++
++                memset(&ev, 0, sizeof ev);
++                ev.u.u.type = ClientMessage;
++                ev.u.u.detail = 32;
++                ev.u.clientMessage.window = win->drawable.id;
++                ev.u.clientMessage.u.l.type = atom_wm_protocols;
++                ev.u.clientMessage.u.l.longs0 = atom_wm_delete_window;
++                ev.u.clientMessage.u.l.longs1 = currentTime.milliseconds;
++                DeliverEventsToWindow(inputInfo.pointer, win, &ev, 1,
++                                      NoEventMask, NullGrab);
++                return;
++            }
++    }
++    if (client && client != serverClient && !client->clientGone) {
++        LogMessage(X_INFO, "RISC OS: closing a window that can't be "
++                   "deleted: disconnecting its client\n");
++        CloseDownClient(client);
++    }
++}
++
++/* The frame got the caret: X's input focus goes to its window. */
++void
++riscosFrameFocus(int handle)
++{
++    RiscosFrame *f = frameForHandle(handle);
++
++    if (!f || !f->rl || !f->rl->win || !f->decorated)
++        return;
++    SetInputFocus(serverClient, inputInfo.keyboard, f->rl->win->drawable.id,
++                  RevertToPointerRoot, CurrentTime, FALSE);
++}
++
++/* Override-redirect windows (menus, tooltips) stay above the others: after
++   a frame is raised, raise them again, in their X stacking order, on the
++   Wimp's stack and X's. */
++static void
++raiseOverrides(void)
++{
++    WindowPtr root = rd_root(), win;
++
++    if (!root)
++        return;
++    for (win = root->lastChild; win; win = win->prevSib) {
++        RiscosFrame *f;
++
++        for (f = frames; f; f = f->next)
++            if (f->rl && f->rl->win == win && !f->decorated && f->open) {
++                XID above = Above;
++
++                frameOpen(f, WIMP_TOP);
++                native_change++;
++                ConfigureWindow(win, CWStackMode, &above, wClient(win));
++                native_change--;
++            }
++    }
++}
++
++/* A click in a frame: to the front, as the title bar does. */
++void
++riscosFrameClick(int handle)
++{
++    RiscosFrame *f = frameForHandle(handle);
++    int block[9];
++
++    if (!f || !f->decorated)
++        return;
++    block[0] = f->handle;
++    if (_swix(Wimp_GetWindowState, _IN(1), block) != NULL ||
++        block[7] == WIMP_TOP)
++        return;
++    block[7] = WIMP_TOP;
++    frameOpenRequest(f, block);
++}
++
++/* Wimp events for frames. Returns -1 if the event isn't for one, else
++   non-zero if X has work to do. */
++int
++riscosRootlessEvent(int reason, int *block)
++{
++    RiscosFrame *f;
++
++    switch (reason) {
++    case Redraw_Window_Request:
++        if (!(f = frameForHandle(block[0])))
++            return -1;
++        frameRedraw(f, block);
++        return 0;
++    case Open_Window_Request:
++        if (!(f = frameForHandle(block[0])))
++            return -1;
++        frameOpenRequest(f, block);
++        return 1;
++    case Close_Window_Request:
++        if (!(f = frameForHandle(block[0])))
++            return -1;
++        frameCloseRequest(f);
++        return 1;
++    default:
++        return -1;
++    }
++}
++
++/* The desktop's mode changed: put every frame where X has it. */
++void
++riscosRootlessModeChange(void)
++{
++    RiscosFrame *f;
++
++    for (f = frames; f; f = f->next) {
++        frameExtent(f);
++        if (f->open)
++            frameOpen(f, -3);
++    }
++    queueSync();
++}
++
++/* ---- Setting up ---- */
++
++Bool
++riscosRootlessInit(ScreenPtr pScreen)
++{
++    KdScreenPriv(pScreen);
++
++    screen_bpp = pScreenPriv->screen->fb.bitsPerPixel;
++    frame_screen = pScreen;
++    if (!RootlessInit(pScreen, &riscosFrameProcs))
++        return FALSE;
++    /* fb's copies; there's nothing faster to call */
++    rootless_CopyBytes_threshold = 0;
++    rootless_CopyWindow_threshold = 0;
++    atom_net_wm_name = MakeAtom("_NET_WM_NAME", 12, TRUE);
++    atom_utf8 = MakeAtom("UTF8_STRING", 11, TRUE);
++    atom_wm_protocols = MakeAtom("WM_PROTOCOLS", 12, TRUE);
++    atom_wm_delete_window = MakeAtom("WM_DELETE_WINDOW", 16, TRUE);
++    if (!XaceRegisterCallback(XACE_PROPERTY_ACCESS, propertyAccess, NULL))
++        LogMessage(X_WARNING, "RISC OS: titles won't follow WM_NAME\n");
++    LogMessage(X_INFO, "RISC OS: rootless: each X window is a RISC OS "
++               "window\n");
++    return TRUE;
++}
+--- a/hw/kdrive/riscos/options.c	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/kdrive/riscos/options.c	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,116 @@
++/*
++ * Xriscos: options kept between runs.
++ *
++ * A text file of "Name value" lines, read from Choices:Xriscos.Options (or,
++ * without a Choices$Write, <Xriscos$Dir>.Options), and written back when an
++ * option is changed from the icon bar menu. Only Rootless so far.
++ */
++#ifdef HAVE_CONFIG_H
++#include <kdrive-config.h>
++#endif
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include <kernel.h>
++#include <swis.h>
++#include "riscos.h"
++
++#define OPTIONS_READ_CHOICES    "Choices:Xriscos.Options"
++#define OPTIONS_WRITE_DIR       "<Choices$Write>.Xriscos"
++#define OPTIONS_WRITE_CHOICES   "<Choices$Write>.Xriscos.Options"
++#define OPTIONS_LOCAL           "<Xriscos$Dir>.Options"
++#define FILETYPE_TEXT           0xFFF
++#define OPTIONS_MAX             4096
++
++Bool riscosOptRootless;         /* as saved: for the next start */
++
++/* Read a whole file; NULL if it isn't there. */
++static char *
++readFile(const char *name, int *len)
++{
++    int type = 0, size = 0;
++    char *buf;
++
++    if (_swix(OS_File, _INR(0, 1) | _OUT(0) | _OUT(4), 17, name, &type,
++              &size) != NULL || type != 1 || size > OPTIONS_MAX)
++        return NULL;
++    buf = malloc(size + 1);
++    if (!buf)
++        return NULL;
++    if (_swix(OS_File, _INR(0, 3), 16, name, buf, 0) != NULL) {
++        free(buf);
++        return NULL;
++    }
++    buf[size] = '\0';
++    *len = size;
++    return buf;
++}
++
++static Bool
++isYes(const char *v)
++{
++    return !strncmp(v, "yes", 3) || !strncmp(v, "on", 2) || *v == '1';
++}
++
++void
++riscosOptionsLoad(void)
++{
++    int len = 0;
++    char *buf = readFile(OPTIONS_READ_CHOICES, &len), *line, *next;
++
++    if (!buf)
++        buf = readFile(OPTIONS_LOCAL, &len);
++    if (!buf)
++        return;
++    for (line = buf; line && *line; line = next) {
++        char *value;
++
++        next = strchr(line, '\n');
++        if (next)
++            *next++ = '\0';
++        while (isspace((unsigned char) *line))
++            line++;
++        if (*line == '#' || *line == '\0')
++            continue;
++        value = line;
++        while (*value && !isspace((unsigned char) *value))
++            value++;
++        if (*value)
++            *value++ = '\0';
++        while (isspace((unsigned char) *value))
++            value++;
++        if (!strcasecmp(line, "Rootless"))
++            riscosOptRootless = isYes(value);
++    }
++    free(buf);
++}
++
++static _kernel_oserror *
++saveFile(const char *name, const char *text)
++{
++    return _swix(OS_File, _INR(0, 2) | _INR(4, 5), 10, name, FILETYPE_TEXT,
++                 text, text + strlen(text));
++}
++
++/* Returns FALSE, with a message logged, if they couldn't be saved. */
++Bool
++riscosOptionsSave(void)
++{
++    char text[256];
++    _kernel_oserror *e;
++
++    snprintf(text, sizeof text,
++             "# Xriscos options, written by its icon bar menu\n"
++             "Rootless %s\n", riscosOptRootless ? "yes" : "no");
++    /* Choices, as RISC OS 3.5 and later keep them; else beside Xriscos */
++    (void) _swix(OS_File, _INR(0, 1) | _IN(4), 8, OPTIONS_WRITE_DIR, 0);
++    e = saveFile(OPTIONS_WRITE_CHOICES, text);
++    if (e)
++        e = saveFile(OPTIONS_LOCAL, text);
++    if (e) {
++        LogMessage(X_WARNING, "RISC OS: cannot save the options: %s\n",
++                   e->errmess);
++        return FALSE;
++    }
++    return TRUE;
++}
+--- a/fb/fbpict.c	2019-02-02 09:35:14.000000000 +0000
++++ b/fb/fbpict.c	2026-11-07 12:02:08.547631753 +0000
+@@ -296,13 +296,33 @@
+     FbStride stride;
+     int bpp;
+     pixman_image_t *image;
++    int width, height;
+ 
+     fbGetDrawablePixmap(pict->pDrawable, pixmap, *xoff, *yoff);
+     fbGetPixmapBitsData(pixmap, bits, stride, bpp);
+ 
++    /* The image must reach the window wherever it is in its pixmap. The
++       rootless layer (miext/rootless) points a framed window's pixmap at
++       the frame's pixels with its base moved back to the screen's origin,
++       so that screen coordinates index it, but leaves the pixmap the
++       frame's size: bounded by that, a window away from the top left of
++       the screen got nothing from Render, and one near it had Render write
++       outside its frame. Elsewhere windows lie within their pixmaps, and
++       this changes nothing. */
++    width = pixmap->drawable.width;
++    height = pixmap->drawable.height;
++    if (pict->pDrawable->type == DRAWABLE_WINDOW) {
++        int right = *xoff + pict->pDrawable->x + pict->pDrawable->width;
++        int bottom = *yoff + pict->pDrawable->y + pict->pDrawable->height;
++
++        if (right > width)
++            width = right;
++        if (bottom > height)
++            height = bottom;
++    }
++
+     image = pixman_image_create_bits((pixman_format_code_t) pict->format,
+-                                     pixmap->drawable.width,
+-                                     pixmap->drawable.height, (uint32_t *) bits,
++                                     width, height, (uint32_t *) bits,
+                                      stride * sizeof(FbStride));
+ 
+     if (!image)
+--- a/miext/rootless/rootlessScreen.c	2019-02-02 09:32:48.000000000 +0000
++++ b/miext/rootless/rootlessScreen.c	2026-11-07 11:53:24.308240628 +0000
+@@ -41,6 +41,7 @@
+ #include "propertyst.h"
+ #include "mivalidate.h"
+ #include "picturestr.h"
++#include "mipict.h"
+ #include "colormapst.h"
+ 
+ #include <sys/types.h>
+@@ -275,6 +276,77 @@
+     // SCREEN_WRAP(ps, Composite);
+ }
+ 
++/*
++ * Trapezoids and Triangles: fb draws them straight into the destination
++ * (pixman), so a framed window has to be drawing then, as for Composite,
++ * and what they cover is damage. (Not wrapped in the original layer,
++ * whose users rendered these through Composite: xeyes' eyes, drawn with
++ * Render, were lost.)
++ */
++static void
++RootlessTrapezoids(CARD8 op, PicturePtr pSrc, PicturePtr pDst,
++                   PictFormatPtr maskFormat, INT16 xSrc, INT16 ySrc,
++                   int ntrap, xTrapezoid *traps)
++{
++    ScreenPtr pScreen = pDst->pDrawable->pScreen;
++    PictureScreenPtr ps = GetPictureScreen(pScreen);
++    WindowPtr srcWin, dstWin;
++
++    srcWin = (pSrc->pDrawable && pSrc->pDrawable->type == DRAWABLE_WINDOW) ?
++        (WindowPtr) pSrc->pDrawable : NULL;
++    dstWin = (pDst->pDrawable->type == DRAWABLE_WINDOW) ?
++        (WindowPtr) pDst->pDrawable : NULL;
++
++    if (srcWin && IsFramedWindow(srcWin))
++        RootlessStartDrawing(srcWin);
++    if (dstWin && IsFramedWindow(dstWin))
++        RootlessStartDrawing(dstWin);
++
++    ps->Trapezoids = SCREENREC(pScreen)->Trapezoids;
++    ps->Trapezoids(op, pSrc, pDst, maskFormat, xSrc, ySrc, ntrap, traps);
++    ps->Trapezoids = RootlessTrapezoids;
++
++    if (dstWin && IsFramedWindow(dstWin) && ntrap > 0) {
++        BoxRec box;
++
++        miTrapezoidBounds(ntrap, traps, &box);
++        RootlessDamageRect(dstWin, box.x1, box.y1,
++                           box.x2 - box.x1, box.y2 - box.y1);
++    }
++}
++
++static void
++RootlessTriangles(CARD8 op, PicturePtr pSrc, PicturePtr pDst,
++                  PictFormatPtr maskFormat, INT16 xSrc, INT16 ySrc,
++                  int ntri, xTriangle *tris)
++{
++    ScreenPtr pScreen = pDst->pDrawable->pScreen;
++    PictureScreenPtr ps = GetPictureScreen(pScreen);
++    WindowPtr srcWin, dstWin;
++
++    srcWin = (pSrc->pDrawable && pSrc->pDrawable->type == DRAWABLE_WINDOW) ?
++        (WindowPtr) pSrc->pDrawable : NULL;
++    dstWin = (pDst->pDrawable->type == DRAWABLE_WINDOW) ?
++        (WindowPtr) pDst->pDrawable : NULL;
++
++    if (srcWin && IsFramedWindow(srcWin))
++        RootlessStartDrawing(srcWin);
++    if (dstWin && IsFramedWindow(dstWin))
++        RootlessStartDrawing(dstWin);
++
++    ps->Triangles = SCREENREC(pScreen)->Triangles;
++    ps->Triangles(op, pSrc, pDst, maskFormat, xSrc, ySrc, ntri, tris);
++    ps->Triangles = RootlessTriangles;
++
++    if (dstWin && IsFramedWindow(dstWin) && ntri > 0) {
++        BoxRec box;
++
++        miTriangleBounds(ntri, tris, &box);
++        RootlessDamageRect(dstWin, box.x1, box.y1,
++                           box.x2 - box.x1, box.y2 - box.y1);
++    }
++}
++
+ static void
+ RootlessGlyphs(CARD8 op, PicturePtr pSrc, PicturePtr pDst,
+                PictFormatPtr maskFormat, INT16 xSrc, INT16 ySrc,
+@@ -699,6 +771,10 @@
+         ps->Composite = RootlessComposite;
+         s->Glyphs = ps->Glyphs;
+         ps->Glyphs = RootlessGlyphs;
++        s->Trapezoids = ps->Trapezoids;
++        ps->Trapezoids = RootlessTrapezoids;
++        s->Triangles = ps->Triangles;
++        ps->Triangles = RootlessTriangles;
+     }
+ 
+     // WRAP(ClearToBackground); fixme put this back? useful for shaped wins?
+--- a/miext/rootless/rootlessCommon.h	2019-02-02 09:32:48.000000000 +0000
++++ b/miext/rootless/rootlessCommon.h	2026-11-07 11:53:16.669501385 +0000
+@@ -108,6 +108,8 @@
+ 
+     CompositeProcPtr Composite;
+     GlyphsProcPtr Glyphs;
++    TrapezoidsProcPtr Trapezoids;
++    TrianglesProcPtr Triangles;
+ 
+     InstallColormapProcPtr InstallColormap;
+     UninstallColormapProcPtr UninstallColormap;
