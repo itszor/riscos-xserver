@@ -177,7 +177,11 @@ The Wimp is the window manager, on the ARM, so no X window manager runs on
 the PC and nothing for one crosses the network:
 
 - Ordinary windows get a title bar (`_NET_WM_NAME` or `WM_NAME`, followed
-  through an XACE property hook), back, close, toggle-size and size icons;
+  through an XACE property hook), back, close and toggle-size icons, and a
+  size icon where RISC OS shows one without a scroll bar (3.70 doesn't). A
+  drag from the bottom right 5 pixels of a window resizes it, as the size
+  icon would (`Wimp_DragBox` type 2), with X's `bottom_right_corner` cursor
+  while the pointer is there; X doesn't see a press that starts there;
   override-redirect ones (menus, tooltips) none, and they are kept above
   the others.
 - Moving, resizing, raising or lowering a window on the desktop
@@ -204,8 +208,9 @@ Found on the way (all fixed here):
 - **Flushing:** the layer reports damage with `DamageRects` and asks for it to
   be shown with `UpdateRegion(NULL)` or with `StopDrawing(flush)`, depending
   on whether the frame was being drawn on; both must flush.
-- **RISC OS 3.70 shows a window's size icon only beside a scroll bar**, so
-  decorated frames have a vertical one, which does nothing.
+- **RISC OS 3.70 shows a window's size icon only beside a scroll bar**, and
+  an X window has no use for one, so frames have none, and resize from
+  their bottom right corner instead.
 
 Tested on "My RiscPC" with `-rootless`: `xterm` (core and Xft fonts),
 `xclock` (core and `-render`), and `xeyes` in each combination of Render,
