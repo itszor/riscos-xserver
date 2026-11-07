@@ -240,7 +240,11 @@ the X window to match (40,60 to 100,211), the size icon resized it (to
 the focus, xterm's Ctrl+click menu opened as an undecorated window, the
 close icon closed an xeyes, and scrolling output displayed at once. The
 menu item saved the option, the server came up rootless from it, and
-unticking it said the change would come at the next start.
+unticking it said the change would come at the next start. Later:
+dragging a window's bottom right corner resizes it, with X's resize
+cursor; LibreOffice 26.2's start centre (from a Linux host) draws its text
+as Xvfb does at the same depth; Firefox ran and scrolled until the
+Composite fault above, since fixed (not yet re-run).
 
 Rootless limitations:
 
