@@ -211,6 +211,17 @@ Found on the way (all fixed here):
 - **RISC OS 3.70 shows a window's size icon only beside a scroll bar**, and
   an X window has no use for one, so frames have none, and resize from
   their bottom right corner instead.
+- **The layer's scratch pixmap headers went back to the pool dirty.**
+  `SetPixmapBaseToScreen` sets `drawable.x` to 1 for a 16bpp frame at an
+  odd address, and `ModifyPixmapHeader` doesn't reset it, so the next user
+  of the screen's scratch header, Render's `AddGlyphs`, took each glyph from
+  one pixel in: LibreOffice's text lost a column, and i and l vanished. The
+  layer now clears it (and `screen_x`/`y`) before freeing a header. Its
+  headers are also sized to reach the frame in screen coordinates, as dix
+  bounds `GetImage` on a window by its pixmap (xwd of a window away from
+  the top left failed with BadMatch while it was being drawn on), and
+  `RootlessGlyphs` damages the union of the glyphs (it took the max of the
+  left and top edges).
 - **Composite is off when rootless.** Composite redirects any ARGB window
   (Firefox's popups, for one) and sets its pixmap's `screen_x`/`screen_y`;
   in a frame that pixmap is the layer's scratch header, which went back to

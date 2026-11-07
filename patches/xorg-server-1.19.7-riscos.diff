@@ -4029,7 +4029,7 @@
  
      if (!image)
 --- a/miext/rootless/rootlessScreen.c	2019-02-02 09:32:48.000000000 +0000
-+++ b/miext/rootless/rootlessScreen.c	2026-11-07 11:53:24.308240628 +0000
++++ b/miext/rootless/rootlessScreen.c	2026-11-07 19:20:38.791031609 +0000
 @@ -41,6 +41,7 @@
  #include "propertyst.h"
  #include "mivalidate.h"
@@ -4116,6 +4116,17 @@
  static void
  RootlessGlyphs(CARD8 op, PicturePtr pSrc, PicturePtr pDst,
                 PictFormatPtr maskFormat, INT16 xSrc, INT16 ySrc,
+@@ -339,8 +411,8 @@
+                     x2 = x1 + glyph->info.width;
+                     y2 = y1 + glyph->info.height;
+ 
+-                    box.x1 = max(box.x1, x1);
+-                    box.y1 = max(box.y1, y1);
++                    box.x1 = min(box.x1, x1);
++                    box.y1 = min(box.y1, y1);
+                     box.x2 = max(box.x2, x2);
+                     box.y2 = max(box.y2, y2);
+ 
 @@ -699,6 +771,10 @@
          ps->Composite = RootlessComposite;
          s->Glyphs = ps->Glyphs;
@@ -4128,7 +4139,7 @@
  
      // WRAP(ClearToBackground); fixme put this back? useful for shaped wins?
 --- a/miext/rootless/rootlessCommon.h	2019-02-02 09:32:48.000000000 +0000
-+++ b/miext/rootless/rootlessCommon.h	2026-11-07 11:53:16.669501385 +0000
++++ b/miext/rootless/rootlessCommon.h	2026-11-07 19:20:38.789192696 +0000
 @@ -108,6 +108,8 @@
  
      CompositeProcPtr Composite;
@@ -4138,3 +4149,23 @@
  
      InstallColormapProcPtr InstallColormap;
      UninstallColormapProcPtr UninstallColormap;
+@@ -241,6 +243,19 @@
+     }                                                                       \
+ }
+ 
++/*
++ * A frame's pixmap, once SetPixmapBaseToScreen has moved its base back to
++ * the screen's origin, is indexed by screen coordinates, so its size must
++ * reach the frame's far corner in those: dix bounds GetImage on a window by
++ * its pixmap's size, and refused a frame away from the top left while it
++ * was being drawn on.
++ */
++#define SetPixmapSizeToScreen(pix, _x, _y, _w, _h) {                        \
++    PixmapPtr   _pPx = (PixmapPtr) (pix);                                   \
++    _pPx->drawable.width = (_w) + ((_x) > 0 ? (_x) : 0);                    \
++    _pPx->drawable.height = (_h) + ((_y) > 0 ? (_y) : 0);                   \
++}
++
+ // Returns TRUE if this window is visible inside a frame
+ // (e.g. it is visible and has a top-level or root parent)
+ Bool IsFramedWindow(WindowPtr pWin);
