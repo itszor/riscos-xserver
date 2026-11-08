@@ -302,6 +302,8 @@ events all the time, which costs a task switch per poll.
 
 | Path | What |
 |---|---|
+| `setup.sh` | Host setup: checks tools, runs `fetch-sources.sh`, builds the Docker image, clones GCCSDK |
+| `build.sh` | Runs the whole build in the image; servers, SharedULib and keymaps end up in `stage/` |
 | `fetch-sources.sh` | Downloads the upstream tarballs, checks `sources/SHA256SUMS`, unpacks into `build/` and applies `patches/` |
 | `docker/Dockerfile` | GCCSDK image plus pkg-config, autotools, util-macros, xkbcomp |
 | `build-deps.sh` | Cross-builds zlib, libsha1, xorgproto, xtrans, libXau, libfontenc, libXfont2, pixman into `prefix/` |
@@ -322,18 +324,31 @@ events all the time, which costs a task switch per poll.
 
 ## Reproduce
 
+Needs Docker (the user in the `docker` group), git, wget, patch and the usual
+archive tools on the host.
+
+```
+./setup.sh      # checks host tools, fetches and patches sources, builds the
+                # Docker image, clones GCCSDK (for SharedULib) into gccsdk/
+./build.sh      # deps, keymaps, xorg-server, SharedULib, AIF: all into stage/
+./stage.sh      # copy the servers and guest/ to the emulator's HostFS
+```
+
+`./build.sh xserver aif` reruns just those steps (`deps xkb xserver sul aif`).
+The individual steps, which those scripts run:
+
 ```
 ./fetch-sources.sh
 docker build -t xdev-gccsdk:1 docker
 docker run --rm -u $(id -u):$(id -g) -v "$PWD":/xdev xdev-gccsdk:1 /xdev/build-deps.sh
 docker run --rm -u $(id -u):$(id -g) -v "$PWD":/xdev xdev-gccsdk:1 /xdev/xkb/make-xkm.sh
 docker run --rm -u $(id -u):$(id -g) -v "$PWD":/xdev xdev-gccsdk:1 /xdev/build-xserver.sh
-./build-sul.sh                           # SharedULib,ffa into stage/
+./build-sul.sh gccsdk                    # SharedULib,ffa into stage/
 ./stage.sh
 tools/start-xvfb.sh                      # emulator must be running
 DISPLAY=localhost:100 xdpyinfo           # NAT forward host 6100 -> guest 6000
 ```
 
-`build/`, `prefix/`, `logs/`, `stage/` and the tarballs are generated and not
+`build/`, `prefix/`, `logs/`, `stage/`, `gccsdk/` and the tarballs are generated and not
 in git. On the machine, HostFS `XDev` needs `Xvfb`, `SharedULib`, the
 `xkb.precompiled` keymaps from `stage/xkb`, and the files in `guest/`.
