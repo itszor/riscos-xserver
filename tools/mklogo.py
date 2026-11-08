@@ -8,9 +8,15 @@ covers, so the edges are smoothed. The sprite is mode 20 (16 colours, 2x2
 OS units per pixel, the "2x2" icon size), 34x34 pixels, with a mask.
 
 Usage: mklogo.py HEADER.h [SPRITEFILE [PREVIEW.png]]
+       mklogo.py --app NAME SPRITES SPRITES22
   HEADER.h    C source for the sprite area, for hw/kdrive/riscos
   SPRITEFILE  the same as a RISC OS sprite file (an !Sprites22)
   PREVIEW.png a magnified preview, to look at on the host
+
+--app writes an application's icons, NAME being its directory name without
+the "!" (sprite names are lower case): SPRITES holds "!name" (34x17) and
+"sm!name" (18x9) in mode 12, for rectangular-pixel modes, and SPRITES22 the
+same at 34x34 and 18x18 in mode 20, for square ones.
 """
 import struct
 import sys
@@ -55,7 +61,9 @@ def inside(poly, x, y):
     return c
 
 
-def render():
+def render(SIZE=SIZE, LOGO=LOGO):
+    """Coverage (0 to 1) of each pixel of a SIZE x SIZE sprite by a LOGO x
+    LOGO logo centred in it."""
     big = LOGO * SCALE
     polys = xmu_logo_polys(big)
     grid = [[False] * big for _ in range(big)]
@@ -75,12 +83,20 @@ def render():
     return cover
 
 
-def sprite(cover):
+def halve_rows(cover):
+    """Average pairs of rows, for a mode with pixels twice as tall."""
+    return [[(a + b) / 2 for a, b in zip(cover[y], cover[y + 1])]
+            for y in range(0, len(cover) - 1, 2)]
+
+
+def sprite(cover, NAME=NAME, MODE=MODE):
     """One old-format 4bpp sprite with a mask: header and data."""
+    SIZE = len(cover[0])            # width
+    HEIGHT = len(cover)
     words = (SIZE * 4 + 31) // 32
     row = words * 4
-    image, mask = bytearray(row * SIZE), bytearray(row * SIZE)
-    for y in range(SIZE):
+    image, mask = bytearray(row * HEIGHT), bytearray(row * HEIGHT)
+    for y in range(HEIGHT):
         for x in range(SIZE):
             c = cover[y][x]
             if c < 1 / 16:
@@ -90,7 +106,7 @@ def sprite(cover):
             image[y * row + x // 2] |= colour << shift
             mask[y * row + x // 2] |= 0xF << shift
     header = struct.pack("<I12sIIIIIII", 44 + 2 * len(image), NAME,
-                         words - 1, SIZE - 1, 0, (SIZE * 4 - 1) & 31,
+                         words - 1, HEIGHT - 1, 0, (SIZE * 4 - 1) & 31,
                          44, 44 + len(image), MODE)
     return header + bytes(image) + bytes(mask)
 
@@ -109,10 +125,22 @@ def write_header(path, spr):
         f.write("#define RISCOS_LOGO_SIZE %d\n" % SIZE)
 
 
-def write_spritefile(path, spr):
+def write_spritefile(path, *sprites):
     # A sprite file is a sprite area without its first word.
+    data = b"".join(sprites)
     with open(path, "wb") as f:
-        f.write(struct.pack("<III", 1, 16, 16 + len(spr)) + spr)
+        f.write(struct.pack("<III", len(sprites), 16, 16 + len(data)) + data)
+
+
+def write_app_sprites(name, path, path22):
+    """!Sprites (mode 12) and !Sprites22 (mode 20) for an application."""
+    big, small = render(), render(18, 16)
+    big_name = ("!" + name.lower()).encode()
+    small_name = ("sm!" + name.lower()).encode()
+    write_spritefile(path, sprite(halve_rows(big), big_name, 12),
+                     sprite(halve_rows(small), small_name, 12))
+    write_spritefile(path22, sprite(big, big_name, 20),
+                     sprite(small, small_name, 20))
 
 
 def write_png(path, cover, mag=8):
@@ -140,6 +168,9 @@ def write_png(path, cover, mag=8):
 
 
 def main():
+    if sys.argv[1:2] == ["--app"]:
+        write_app_sprites(*sys.argv[2:5])
+        return
     cover = render()
     spr = sprite(cover)
     write_header(sys.argv[1], spr)

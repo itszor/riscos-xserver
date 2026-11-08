@@ -13,3 +13,4 @@
 /tools/xping/xping
 __pycache__/
 /gccsdk/
+/dist/

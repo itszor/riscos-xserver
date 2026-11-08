@@ -1,0 +1,7 @@
+m%=0:i%=0
+ON ERROR END
+REPEAT
+SYS "OS_Module",12,m%,i% TO ,m%,i%,b%
+n%=b%+b%!16:s$="":WHILE ?n%>=32:s$+=CHR$?n%:n%+=1:ENDWHILE
+PRINT ~b%;" ";~(b%-4+!(b%-4));" ";s$
+UNTIL FALSE

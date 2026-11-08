@@ -1,0 +1,15 @@
+| !Run for !Xriscos: the X server for the RISC OS desktop.
+| Arguments are passed on to the server, e.g. -rootless or -screen 800x600x24
+| (*Filer_Run doesn't pass any; use *Run <Xriscos$Dir>.!Run -rootless).
+| The server's messages go to <Xriscos$Dir>.xlog.
+Set Xriscos$Dir <Obey$Dir>
+IconSprites <Xriscos$Dir>.!Sprites
+RMEnsure UtilityModule 3.50 Error Xriscos needs RISC OS 3.5 or later
+RMEnsure SharedUnixLibrary 1.07 RMLoad <Xriscos$Dir>.SharedULib
+RMEnsure SharedUnixLibrary 1.07 Error Xriscos needs SharedUnixLibrary 1.07 or later
+| The X screen and, when rootless, each window's pixels are in this slot.
+WimpSlot -min 8000K -max 8000K
+| The server finds its keymaps (-xkbdir) and writes its log relative to the
+| current directory.
+Dir <Xriscos$Dir>
+Run <Xriscos$Dir>.!RunImage :0 -listen tcp -ac -xkbdir xkb %*0 2> xlog

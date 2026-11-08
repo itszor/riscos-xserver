@@ -1,0 +1,3 @@
+10 ON ERROR PRINT "ptr_default: ";REPORT$:END
+20 SYS "Wimp_SpriteOp",40,,"ptr_default" TO ,,,w%,h%
+30 PRINT "ptr_default exists: ";w%;"x";h%

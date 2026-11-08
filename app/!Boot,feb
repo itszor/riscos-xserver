@@ -1,0 +1,3 @@
+| !Boot for !Xriscos: seen by the Filer, so the application has its icon.
+If "<Xriscos$Dir>" = "" Then Set Xriscos$Dir <Obey$Dir>
+IconSprites <Obey$Dir>.!Sprites

@@ -309,6 +309,8 @@ events all the time, which costs a task switch per poll.
 | `build-deps.sh` | Cross-builds zlib, libsha1, xorgproto, xtrans, libXau, libfontenc, libXfont2, pixman into `prefix/` |
 | `build-xserver.sh` | Configures and builds xorg-server (Xvfb only for now) |
 | `build-sul.sh` | Builds the SharedUnixLibrary module RISC OS 3.70 needs, from a GCCSDK clone |
+| `dist.sh` | Puts together the `!Xriscos` application from `stage/` and `app/` in `dist/`, and zips it with RISC OS filetypes (`tools/riscos-zip.py`) |
+| `app/` | `!Xriscos`'s `!Run`, `!Boot` and `!Help` (its `!Sprites` are made by `tools/mklogo.py --app`) |
 | `stage.sh` | Rebuild, convert Xvfb and Xriscos to AIF, copy them and `guest/` to the machine's HostFS |
 | `make-patch.sh` | Regenerate `patches/` from the edited tree in `build/` and check it reproduces it |
 | `compat/riscos-compat.h` | Force-included header filling UnixLib gaps |
@@ -332,6 +334,7 @@ archive tools on the host.
                 # Docker image, clones GCCSDK (for SharedULib) into gccsdk/
 ./build.sh      # deps, keymaps, xorg-server, SharedULib, AIF: all into stage/
 ./stage.sh      # copy the servers and guest/ to the emulator's HostFS
+./dist.sh       # or: the !Xriscos application, and a zip of it, in dist/
 ```
 
 `./build.sh xserver aif` reruns just those steps (`deps xkb xserver sul aif`).
@@ -352,3 +355,25 @@ DISPLAY=localhost:100 xdpyinfo           # NAT forward host 6100 -> guest 6000
 `build/`, `prefix/`, `logs/`, `stage/`, `gccsdk/` and the tarballs are generated and not
 in git. On the machine, HostFS `XDev` needs `Xvfb`, `SharedULib`, the
 `xkb.precompiled` keymaps from `stage/xkb`, and the files in `guest/`.
+
+## Distribution
+
+`./dist.sh` (after `build.sh`) makes `dist/!Xriscos`, an ordinary RISC OS
+application: double-click it to start the server, with the same arguments
+as `XDev.RunX` (`*Run <Xriscos$Dir>.!Run -rootless` passes them on).
+
+| In `!Xriscos` | From |
+|---|---|
+| `!Run`, `!Boot`, `!Help` | `app/` |
+| `!Sprites`, `!Sprites22` | `tools/mklogo.py --app`: the icon bar's X logo, large and small, mode 12 and mode 20 |
+| `!RunImage` | `stage/Xriscos,ff8` |
+| `SharedULib` | `stage/SharedULib,ffa`, loaded by `!Run` unless a SharedUnixLibrary is |
+| `xkb/precompiled/*.xkm` | `stage/xkb` |
+| `Licence` | `LICENSE` and xorg-server's `COPYING` |
+
+The files have HostFS `,xxx` filetype suffixes, so the folder can be copied
+straight to a HostFS (`./dist.sh <dir>` does that, keeping an `Options`
+already there). `dist/Xriscos-<git describe>.zip` holds the same, the
+suffixes turned into Acorn extra fields (`ARC0`, ID 0x4341), as SparkFS and
+Info-ZIP on RISC OS write and read them. Unzipped on Linux, the files lose
+their types.

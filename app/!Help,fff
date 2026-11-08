@@ -1,0 +1,99 @@
+Xriscos
+=======
+
+An X Window System server for the RISC OS desktop: X programs running on
+other computers (Linux, the BSDs, ...) show their windows on RISC OS, and
+take its keyboard and mouse. Built from xorg-server 1.19.7 (a kdrive server).
+
+Needs RISC OS 3.5 or later and an Internet stack; developed and tested on
+RISC OS 3.70 on a StrongARM Risc PC.
+
+
+Starting it
+-----------
+
+Double-click !Xriscos. The X logo appears on the icon bar and the X screen
+(640x480 to start with) in a window. It is display :0, listening on TCP port
+6000, so from another computer:
+
+    DISPLAY=riscpc:0 xterm &
+
+(riscpc being this machine's name or address). Access control is off: any
+computer that can reach port 6000 can use the display, so use it on a
+network you trust.
+
+
+The icon bar icon
+-----------------
+
+  Select       brings the X window to the front (or reopens it)
+  Menu         Fullscreen   X takes over the whole screen (or Alt+Return)
+               Rootless     see below; takes effect at the next start
+               Quit         ends the server and its clients
+
+Closing the X window leaves the server running.
+
+
+The X window
+------------
+
+Select, Menu and Adjust are X buttons 1, 2 and 3. Clicking in the window
+gives it the caret; X gets the keyboard while it has the caret. The keyboard
+layout follows the RISC OS keyboard setting (UK or USA).
+
+Resizing the window resizes the X screen. Alt+Return switches between the
+window and full screen; full screen needs the desktop at X's depth (32K
+colours by default, 16M with -screen WxHx24).
+
+
+Rootless
+--------
+
+With Rootless ticked, there is no X screen window: each X window is a
+RISC OS window of its own, moved, resized, stacked and closed by the Wimp,
+which is the window manager (don't run an X one). Drag a window's bottom
+right corner to resize it. The setting is kept in Choices:Xriscos.Options.
+
+
+Options
+-------
+
+!Run passes its arguments on to the server, as in
+
+    *Run <Xriscos$Dir>.!Run -rootless -screen 800x600x24
+
+  -screen WxH[x24]   X screen size (and 24-bit depth instead of 15)
+  -rootless          rootless for this run, whatever the choices say
+  -norootless        the X screen in one window, likewise
+  -xkb-layout L      keyboard layout (us or gb)
+  -novcache          full screen: leave screen memory uncached
+  -keylog            log each key and its mapping
+
+and the usual X server options. The server writes its messages to xlog in
+this directory. *Set Xriscos$NoBlockCopy 1, before starting, stops rootless
+windows from scrolling with Wimp_BlockCopy.
+
+
+Memory
+------
+
+!Run sets an 8000K slot. A rootless window's pixels take 2 bytes a pixel
+(4 at depth 24) of it, so many large windows may need more: edit WimpSlot
+in !Run.
+
+
+Contents
+--------
+
+  !RunImage    the server
+  SharedULib   SharedUnixLibrary, loaded if no newer one is
+  xkb          precompiled keymaps
+  Licence      the licences of Xriscos and xorg-server
+
+
+Licence
+-------
+
+MIT licence; xorg-server is under its own MIT-style licences. See Licence.
+
+Source and build scripts: https://github.com/itszor/riscos-xserver

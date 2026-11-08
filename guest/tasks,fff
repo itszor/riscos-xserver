@@ -1,0 +1,9 @@
+DIM b% 64:n%=0
+REPEAT
+SYS "TaskManager_EnumerateTasks",n%,b%,64 TO n%,e%
+p%=b%
+WHILE p%<e%
+a%=p%!4:s$="":WHILE ?a%>=32:s$+=CHR$?a%:a%+=1:ENDWHILE:PRINT s$;" slot ";p%!8 DIV 1024;"K"
+p%+=16
+ENDWHILE
+UNTIL n%<0
